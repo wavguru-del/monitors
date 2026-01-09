@@ -13,6 +13,7 @@ FUNCIONAMENTO:
 import os
 import sys
 import re
+import time
 from datetime import datetime
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
@@ -104,52 +105,54 @@ class SodreSantoroMonitor:
         
         try:
             print(f"   → Acessando listagem {category_name}...")
-            page.goto(category_url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
+            page.goto(category_url, wait_until='domcontentloaded', timeout=60000)
+            time.sleep(3)  # Espera inicial
             
-            # Scroll para carregar mais lotes (scroll infinito)
-            prev_count = 0
-            no_change_count = 0
+            # Tenta encontrar cards primeiro
+            try:
+                page.wait_for_selector('a[href*="/leilao/"]', timeout=10000)
+            except:
+                print(f"   → Nenhum lote encontrado em {category_name}")
+                return [], category_name
             
-            for scroll_attempt in range(15):  # Máximo 15 scrolls
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2000)
-                
-                # Conta lotes atuais - usa seletor mais específico
-                current_lots = page.query_selector_all('a[href*="leilao.sodresantoro.com.br/leilao/"]')
-                current_count = len(current_lots)
-                
-                if current_count == prev_count:
-                    no_change_count += 1
-                    if no_change_count >= 3:  # 3 scrolls sem mudança = fim
-                        break
-                else:
-                    no_change_count = 0
-                
-                prev_count = current_count
-            
-            # Extrai todos os links únicos - múltiplos seletores para garantir
-            selectors = [
-                'a[href*="leilao.sodresantoro.com.br/leilao/"]',
-                'a[href*="/lote/"]',
-                'div[id^="lot-"] a',
-            ]
-            
+            # Loop de paginação (botão "Avançar")
+            current_page = 1
+            max_pages = 20
             seen_links = set()
             
-            for selector in selectors:
-                link_elements = page.query_selector_all(selector)
+            while current_page <= max_pages:
+                # Extrai links da página atual
+                cards = page.query_selector_all('a[href*="/leilao/"][href*="/lote/"]')
                 
-                for elem in link_elements:
-                    href = elem.get_attribute('href')
-                    if href and '/lote/' in href and href not in seen_links:
+                page_links = 0
+                for card in cards:
+                    href = card.get_attribute('href')
+                    if href and href not in seen_links:
                         # Normaliza o link
-                        if href.startswith('/'):
+                        if not href.startswith('http'):
                             href = f"https://leilao.sodresantoro.com.br{href}"
                         seen_links.add(href)
                         lot_links.append(href)
+                        page_links += 1
+                
+                print(f"   → Página {current_page}: +{page_links} lotes (total: {len(lot_links)})")
+                
+                # Verifica botão "Avançar"
+                next_button = page.query_selector('button[title="Avançar"]:not([disabled])')
+                
+                if not next_button or current_page >= max_pages:
+                    break
+                
+                try:
+                    next_button.click()
+                    time.sleep(3)
+                    page.wait_for_selector('a[href*="/leilao/"]', timeout=10000)
+                    time.sleep(2)
+                    current_page += 1
+                except:
+                    break
             
-            print(f"   → Encontrados {len(lot_links)} lotes únicos em {category_name}")
+            print(f"   → Total: {len(lot_links)} lotes únicos em {category_name}")
             
         except Exception as e:
             print(f"❌ Erro em {category_url}: {e}")
