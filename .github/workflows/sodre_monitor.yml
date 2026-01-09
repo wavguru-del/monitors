@@ -1,0 +1,68 @@
+name: Sodré Santoro Monitor
+
+on:
+  schedule:
+    # Executa a cada 4 horas
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable debug mode'
+        required: false
+        default: 'false'
+
+env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+  PYTHONUNBUFFERED: '1'  # Logs em tempo real
+
+jobs:
+  monitor-sodre:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: 🔵 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: 📦 Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright supabase-py
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: 🚀 Executar Monitor Sodré Santoro
+        run: |
+          echo "════════════════════════════════════════════════════════════════════"
+          echo "🔵 INICIANDO MONITOR SODRÉ SANTORO"
+          echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "════════════════════════════════════════════════════════════════════"
+          python scraper/sodre_monitor.py
+        continue-on-error: false
+      
+      - name: 📊 Upload logs (em caso de erro)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sodre-monitor-logs-${{ github.run_number }}
+          path: |
+            *.log
+            *.txt
+          retention-days: 7
+      
+      - name: ✅ Finalização
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════"
+          echo "🏁 Monitor Sodré Santoro finalizado"
+          echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "📊 Status: ${{ job.status }}"
+          echo "════════════════════════════════════════════════════════════════════"
