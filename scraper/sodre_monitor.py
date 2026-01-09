@@ -1,45 +1,77 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sodré Santoro Monitor - Histórico de Lances (ASYNC)
+Sodré Santoro Monitor - Sistema de Detecção de Lances
 
-FUNCIONAMENTO OTIMIZADO COM ASYNCIO:
-1. Carrega TODOS os itens ativos da view
-2. Processa em PARALELO (asyncio) para máxima velocidade
-3. UPDATE tabelas base + INSERT histórico
+ARQUIVO: scraper/sodre_monitor.py
+
+FUNCIONAMENTO:
+1. Carrega TODOS os itens ativos do banco (view vw_auctions_unified)
+2. Intercepta dados da API do site Sodré Santoro via Playwright
+3. Cruza por LINK (chave única)
+4. Atualiza tabelas base (bid_actual, bid_has_bid, lot_visits, last_scraped_at)
+5. Salva histórico temporal (auction_bid_history)
+6. Detecta aumentos súbitos de lances
+
+ESTRATÉGIA:
+- Interceptação Passiva (não é engenharia reversa)
+- Escuta as respostas que o site já faz naturalmente
+- Zero requisições extras, 100% seguro e não detectável
 """
 
+import asyncio
 import os
 import sys
-import re
-import asyncio
 from datetime import datetime
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
-# Configuração
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Paralelismo (ajuste conforme necessário)
-MAX_CONCURRENT = 15  # 15 lotes simultâneos
+# URLs para monitorar (Sodré Santoro - Veículos)
+SODRE_URLS = [
+    "https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc",
+]
+
+# Critérios para detectar "itens quentes"
+HOT_ITEM_THRESHOLD_VALUE = 1000  # R$ 1.000 de aumento
+HOT_ITEM_THRESHOLD_PERCENT = 20  # 20% de aumento
 
 
-class SodreSantoroMonitor:
-    """Monitor de lances Sodré Santoro (ASYNC)"""
+# ============================================================================
+# CLASSE PRINCIPAL
+# ============================================================================
+
+class SodreMonitor:
+    """Monitor de lances Sodré Santoro com detecção de padrões"""
     
     def __init__(self):
-        """Inicializa conexões"""
+        """Inicializa conexões e cache"""
         if not SUPABASE_URL or not SUPABASE_KEY:
-            raise ValueError("SUPABASE_URL e SUPABASE_KEY devem estar definidas")
+            raise ValueError("❌ SUPABASE_URL e SUPABASE_KEY devem estar definidas")
         
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        self.db_items = []
-        self.processed = 0
-        self.with_bids = 0
+        
+        # Cache: {link: {category, source, external_id, lot_number, prev_bid, prev_visits}}
+        self.db_items = {}
+        
+        # Dados capturados da API: {link: lot_data}
+        self.api_lots = {}
+    
+    # ========================================================================
+    # ETAPA 1: CARREGAR DADOS DO BANCO
+    # ========================================================================
     
     def load_database_items(self):
-        """Carrega TODOS os itens ativos do banco"""
+        """
+        Carrega TODOS os itens Sodré Santoro ativos do banco.
+        Usa paginação para suportar grandes volumes.
+        """
         print("📥 Carregando itens do banco (Sodré Santoro ativos)...")
         
         try:
@@ -49,7 +81,7 @@ class SodreSantoroMonitor:
             
             while True:
                 response = self.supabase.schema("auctions").table("vw_auctions_unified")\
-                    .select("link,category,source,external_id,lot_number")\
+                    .select("link,category,source,external_id,lot_number,bid_actual,lot_visits")\
                     .eq("source", "sodre")\
                     .eq("is_active", True)\
                     .range(offset, offset + page_size - 1)\
@@ -59,14 +91,16 @@ class SodreSantoroMonitor:
                     break
                 
                 for item in response.data:
-                    if item.get("link"):
-                        self.db_items.append({
-                            "link": item.get("link"),
+                    link = item.get("link")
+                    if link:
+                        self.db_items[link] = {
                             "category": item.get("category"),
                             "source": item.get("source"),
                             "external_id": item.get("external_id"),
                             "lot_number": item.get("lot_number"),
-                        })
+                            "prev_bid": float(item.get("bid_actual") or 0),
+                            "prev_visits": int(item.get("lot_visits") or 0),
+                        }
                 
                 total_loaded += len(response.data)
                 print(f"   → Carregados {total_loaded} itens...")
@@ -76,263 +110,425 @@ class SodreSantoroMonitor:
                 
                 offset += page_size
             
-            print(f"✅ {len(self.db_items)} itens Sodré Santoro carregados da view")
+            print(f"✅ {len(self.db_items)} itens Sodré carregados da view\n")
             return True
             
         except Exception as e:
-            print(f"❌ Erro ao carregar itens: {e}")
+            print(f"❌ Erro ao carregar itens: {e}\n")
             return False
     
-    async def extract_bid_data_from_lot_page(self, page, lot_url: str):
-        """Entra na página do lote e extrai dados da tabela #tabela_lances"""
-        try:
-            await page.goto(lot_url, wait_until='domcontentloaded', timeout=30000)
-            await asyncio.sleep(0.8)
-            
-            # Procura a tabela de lances
-            table = await page.query_selector('#tabela_lances')
-            if not table:
-                return None
-            
-            # Conta linhas de lances
-            bid_rows = await table.query_selector_all('tr[class*="tr_"]')
-            total_bids = len(bid_rows)
-            
-            if total_bids == 0:
-                return None
-            
-            # Pega o lance mais recente (primeiro da lista)
-            first_row = bid_rows[0]
-            tds = await first_row.query_selector_all('td')
-            
-            if len(tds) < 2:
-                return None
-            
-            # Segunda coluna = valor do lance
-            value_text = await tds[1].inner_text()
-            value_text = value_text.strip()
-            value_clean = re.sub(r'[^\d,]', '', value_text)
-            current_value = float(value_clean.replace(',', '.')) if value_clean else 0
-            
-            return {
-                "total_bids": total_bids,
-                "current_value": current_value,
-            }
-            
-        except Exception as e:
-            return None
+    # ========================================================================
+    # ETAPA 2: INTERCEPTAR DADOS DA API (PLAYWRIGHT)
+    # ========================================================================
     
-    async def process_single_lot(self, browser, item, semaphore):
-        """Processa um único lote (com semaphore para limitar paralelismo)"""
-        async with semaphore:
-            context = await browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                locale='pt-BR',
-            )
-            page = await context.new_page()
-            
-            try:
-                lot_url = item["link"]
-                bid_data = await self.extract_bid_data_from_lot_page(page, lot_url)
-                
-                self.processed += 1
-                
-                # Log a cada 50 processados
-                if self.processed % 50 == 0:
-                    print(f"   → Processados {self.processed}/{len(self.db_items)} lotes | {self.with_bids} com lances")
-                
-                if not bid_data:
-                    return None
-                
-                self.with_bids += 1
-                
-                return {
-                    "link": lot_url,
-                    "category": item["category"],
-                    "source": item["source"],
-                    "external_id": item["external_id"],
-                    "lot_number": item["lot_number"],
-                    "total_bids": bid_data["total_bids"],
-                    "current_value": bid_data["current_value"],
-                }
-                
-            except Exception as e:
-                return None
-            finally:
-                await context.close()
-    
-    async def process_all_lots_async(self):
-        """Processa todos os lotes em paralelo com asyncio"""
-        total = len(self.db_items)
-        print(f"\n🔍 Processando {total} lotes em paralelo (max {MAX_CONCURRENT} simultâneos)...\n")
+    async def intercept_sodre_data(self):
+        """
+        Intercepta dados da API Sodré usando Playwright.
+        
+        ESTRATÉGIA:
+        - Abre navegador real (headless)
+        - Deixa o site carregar normalmente
+        - Intercepta respostas de /api/search-lots
+        - Pagina automaticamente até pegar todos os lotes
+        """
+        print("🌐 Iniciando interceptação Playwright...\n")
+        
+        all_lots = []
         
         async with async_playwright() as p:
+            # Navegador headless (invisível) para CI/CD
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--disable-blink-features=AutomationControlled']
             )
             
-            # Semaphore para limitar concorrência
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+                locale='pt-BR'
+            )
             
-            # Cria tasks para todos os lotes
-            tasks = [
-                self.process_single_lot(browser, item, semaphore)
-                for item in self.db_items
-            ]
+            # Anti-detecção
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
             
-            # Executa em paralelo
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            page = await context.new_page()
+            
+            # Função que captura respostas da API
+            async def intercept_response(response):
+                """Escuta passivamente as respostas do site"""
+                try:
+                    if '/api/search-lots' in response.url and response.status == 200:
+                        data = await response.json()
+                        
+                        # Verifica se tem lotes (não só agregações)
+                        per_page = data.get('perPage', 0)
+                        
+                        if per_page > 0:
+                            # Extrai lotes (suporta diferentes estruturas)
+                            results = data.get('results', [])
+                            hits = data.get('hits', {}).get('hits', [])
+                            
+                            if results:
+                                all_lots.extend(results)
+                                print(f"   ✓ Capturados {len(results)} lotes (results)")
+                            elif hits:
+                                extracted = [hit.get('_source', hit) for hit in hits]
+                                all_lots.extend(extracted)
+                                print(f"   ✓ Capturados {len(hits)} lotes (hits)")
+                
+                except Exception:
+                    pass  # Ignora erros de parse
+            
+            # Registra interceptador
+            page.on('response', intercept_response)
+            
+            # Navega nas URLs configuradas
+            for url in SODRE_URLS:
+                try:
+                    print(f"📄 Carregando: {url.split('?')[0]}...")
+                    await page.goto(url, wait_until="networkidle", timeout=60000)
+                    await asyncio.sleep(3)
+                    
+                    # Paginação automática (até 30 páginas)
+                    for page_num in range(2, 31):
+                        try:
+                            # Scroll suave
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await asyncio.sleep(1)
+                            
+                            # Procura botão "próxima página"
+                            selectors = [
+                                'button[aria-label*="next"]',
+                                'button[aria-label*="próxim"]',
+                                '.pagination button:last-child:not([disabled])',
+                                'button:has-text(">")',
+                                '[data-testid="next-page"]',
+                            ]
+                            
+                            clicked = False
+                            for selector in selectors:
+                                try:
+                                    button = page.locator(selector).first
+                                    if await button.count() > 0:
+                                        is_disabled = await button.get_attribute('disabled')
+                                        if is_disabled is None:
+                                            await button.click()
+                                            await asyncio.sleep(3)
+                                            clicked = True
+                                            break
+                                except:
+                                    continue
+                            
+                            if not clicked:
+                                print(f"   ℹ️  Fim da paginação (página {page_num-1})")
+                                break
+                        
+                        except Exception:
+                            break
+                
+                except Exception as e:
+                    print(f"   ⚠️ Erro ao carregar URL: {e}")
             
             await browser.close()
         
-        # Filtra apenas resultados válidos
-        matched_data = [r for r in results if r and not isinstance(r, Exception)]
+        # Indexa lotes por link (chave única)
+        for lot in all_lots:
+            # Suporta diferentes estruturas de ID
+            lot_id = lot.get('lot_id') or lot.get('id')
+            if lot_id:
+                link = f"https://www.sodresantoro.com.br/veiculos/lote/{lot_id}"
+                self.api_lots[link] = lot
         
-        print(f"   ✅ Processamento concluído: {len(matched_data)}/{total} lotes com lances")
-        return matched_data
+        print(f"\n✅ {len(self.api_lots)} lotes únicos capturados da API\n")
+        return len(self.api_lots) > 0
     
-    def create_history_records(self, matched_data):
-        """Cria registros para histórico"""
-        records = []
-        captured_at = datetime.now().isoformat()
+    # ========================================================================
+    # ETAPA 3: CRUZAR DADOS (DB ↔ API)
+    # ========================================================================
+    
+    def cross_reference_data(self):
+        """
+        Cruza dados do banco com dados da API.
         
-        for item in matched_data:
-            records.append({
-                "category": item["category"],
-                "source": item["source"],
-                "external_id": item["external_id"],
-                "lot_number": item["lot_number"],
-                "total_bids": item["total_bids"],
-                "total_bidders": 0,
-                "current_value": item["current_value"],
-                "captured_at": captured_at,
-            })
+        RETORNA:
+        - matched_records: lista de registros com dados completos
+        - hot_items: lista de itens com aumento súbito de lances
+        """
+        print("🔗 Cruzando dados (DB ↔ API)...\n")
         
-        return records
+        matched_records = []
+        hot_items = []
+        
+        for link, db_data in self.db_items.items():
+            api_data = self.api_lots.get(link)
+            
+            if not api_data:
+                continue  # Lote não encontrado na API
+            
+            # Extrai dados atuais da API
+            current_bid = float(api_data.get('bid_actual') or 0)
+            has_bid = api_data.get('bid_has_bid', False)
+            visits = int(api_data.get('lot_visits') or 0)
+            
+            # Calcula variações
+            prev_bid = db_data['prev_bid']
+            bid_increase = current_bid - prev_bid
+            bid_increase_pct = (bid_increase / prev_bid * 100) if prev_bid > 0 else 0
+            
+            prev_visits = db_data['prev_visits']
+            visit_increase = visits - prev_visits
+            
+            # Prepara registro completo
+            record = {
+                "category": db_data["category"],
+                "source": db_data["source"],
+                "external_id": db_data["external_id"],
+                "lot_number": db_data["lot_number"],
+                "bid_actual": current_bid,
+                "bid_has_bid": has_bid,
+                "lot_visits": visits,
+                "captured_at": datetime.now().isoformat(),
+                # Metadados para análise (não vão para o banco)
+                "_bid_increase": bid_increase,
+                "_bid_increase_pct": bid_increase_pct,
+                "_visit_increase": visit_increase,
+            }
+            
+            matched_records.append(record)
+            
+            # Detecta "itens quentes" (critérios ajustáveis)
+            is_hot = (
+                bid_increase >= HOT_ITEM_THRESHOLD_VALUE or 
+                bid_increase_pct >= HOT_ITEM_THRESHOLD_PERCENT
+            )
+            
+            if is_hot:
+                hot_items.append({
+                    **record,
+                    "lot_title": f"{api_data.get('lot_brand', '')} {api_data.get('lot_model', '')}".strip(),
+                })
+        
+        print(f"✅ {len(matched_records)} matches encontrados\n")
+        
+        # Exibe itens quentes
+        if hot_items:
+            print(f"{'='*70}")
+            print(f"🔥 {len(hot_items)} ITENS QUENTES DETECTADOS!")
+            print(f"{'='*70}\n")
+            
+            # Ordena por aumento percentual
+            hot_items.sort(key=lambda x: x['_bid_increase_pct'], reverse=True)
+            
+            for i, item in enumerate(hot_items[:10], 1):  # Top 10
+                print(f"{i:2d}. 🚨 Lote {item['lot_number']}: {item['lot_title']}")
+                print(f"      Lance: R$ {item['bid_actual']:,.2f} "
+                      f"(+R$ {item['_bid_increase']:,.2f} / +{item['_bid_increase_pct']:.1f}%)")
+                print(f"      Visitas: {item['lot_visits']} (+{item['_visit_increase']})\n")
+        
+        return matched_records, hot_items
+    
+    # ========================================================================
+    # ETAPA 4: ATUALIZAR TABELAS BASE
+    # ========================================================================
     
     def update_base_tables(self, records):
-        """Atualiza tabelas base com dados de lances"""
+        """
+        Atualiza tabelas base com dados de lances.
+        
+        ATUALIZA:
+        - bid_actual (lance atual)
+        - bid_has_bid (tem lance?)
+        - lot_visits (visualizações)
+        - last_scraped_at (timestamp)
+        """
+        if not records:
+            return 0
+        
         updated_count = 0
         
+        # Agrupa por categoria (cada categoria é uma tabela)
+        by_category = {}
         for record in records:
-            try:
-                table_name = record["category"]
-                
-                self.supabase.schema("auctions").table(table_name)\
-                    .update({
-                        "total_bids": record["total_bids"],
-                        "total_bidders": record["total_bidders"],
-                        "value": record["current_value"],
-                        "last_scraped_at": record["captured_at"]
-                    })\
-                    .eq("source", record["source"])\
-                    .eq("external_id", record["external_id"])\
-                    .execute()
-                
-                updated_count += 1
-                
-            except Exception as e:
-                print(f"⚠️ Erro ao atualizar {record['category']}/{record['external_id']}: {e}")
-                continue
+            cat = record["category"]
+            if cat not in by_category:
+                by_category[cat] = []
+            by_category[cat].append(record)
         
+        print("📝 Atualizando tabelas base...\n")
+        
+        for category, cat_records in by_category.items():
+            cat_updated = 0
+            cat_errors = 0
+            
+            for record in cat_records:
+                try:
+                    self.supabase.schema("auctions").table(category)\
+                        .update({
+                            "bid_actual": record["bid_actual"],
+                            "bid_has_bid": record["bid_has_bid"],
+                            "lot_visits": record["lot_visits"],
+                            "last_scraped_at": record["captured_at"]
+                        })\
+                        .eq("source", record["source"])\
+                        .eq("external_id", record["external_id"])\
+                        .execute()
+                    
+                    cat_updated += 1
+                    updated_count += 1
+                    
+                except Exception as e:
+                    cat_errors += 1
+                    continue
+            
+            # Log por categoria
+            if cat_updated > 0:
+                print(f"   ✅ {category:45s} | {cat_updated:3d} atualizados | {cat_errors:2d} erros")
+            elif cat_errors > 0:
+                print(f"   ❌ {category:45s} |   0 atualizados | {cat_errors:2d} erros")
+        
+        print()
         return updated_count
     
+    # ========================================================================
+    # ETAPA 5: SALVAR HISTÓRICO
+    # ========================================================================
+    
     def save_bid_history(self, records):
-        """Salva histórico de lances em lote"""
+        """
+        Salva histórico de lances na tabela auction_bid_history.
+        
+        ESTRATÉGIA:
+        - Remove metadados de análise (_bid_increase, etc)
+        - Remove duplicatas (mesmo lot no mesmo segundo)
+        - Upsert com conflict resolution
+        """
         if not records:
             return 0
         
         try:
-            unique_records = {}
+            # Remove metadados internos
+            clean_records = []
             for record in records:
+                clean = {k: v for k, v in record.items() 
+                        if not k.startswith('_')}
+                clean_records.append(clean)
+            
+            # Remove duplicatas baseado em chave única
+            unique_records = {}
+            for record in clean_records:
                 key = (
                     record["category"],
                     record["source"],
                     record["external_id"],
-                    record["captured_at"][:19]
+                    record["captured_at"][:19]  # Trunca para segundos
                 )
                 unique_records[key] = record
             
             records_to_insert = list(unique_records.values())
             
+            # Upsert (insere ou atualiza se já existir)
             response = self.supabase.schema("auctions").table("auction_bid_history")\
                 .upsert(records_to_insert, on_conflict="category,source,external_id,captured_at")\
                 .execute()
             
+            print(f"💾 {len(response.data)} registros salvos no histórico\n")
             return len(response.data)
             
         except Exception as e:
-            print(f"❌ Erro ao salvar histórico: {e}")
+            print(f"❌ Erro ao salvar histórico: {e}\n")
             return 0
     
-    async def run_async(self):
-        """Executa monitoramento completo (async)"""
+    # ========================================================================
+    # ETAPA 6: EXECUTAR MONITORAMENTO COMPLETO
+    # ========================================================================
+    
+    async def run(self):
+        """Executa monitoramento completo (orquestração)"""
         print("\n" + "="*70)
-        print("🔵 SODRÉ SANTORO MONITOR - HISTÓRICO DE LANCES (ASYNC)")
+        print("🔵 SODRÉ SANTORO MONITOR - DETECÇÃO DE LANCES")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"⚡ Paralelismo: {MAX_CONCURRENT} lotes simultâneos")
         print("="*70)
+        print()
         
+        # 1. Carrega itens do banco
         if not self.load_database_items():
-            print("❌ Falha ao carregar itens do banco")
             return False
         
         if not self.db_items:
-            print("⚠️ Nenhum item ativo encontrado no banco")
+            print("⚠️ Nenhum item ativo no banco\n")
             return True
         
-        # Processa todos os lotes em paralelo
-        all_matched = await self.process_all_lots_async()
+        # 2. Intercepta dados da API
+        if not await self.intercept_sodre_data():
+            print("❌ Falha ao capturar dados da API\n")
+            return False
         
-        # Cria registros de histórico
-        all_records = self.create_history_records(all_matched)
+        # 3. Cruza dados
+        matched_records, hot_items = self.cross_reference_data()
         
-        print("\n" + "="*70)
-        print("🔄 Atualizando tabelas base (total_bids, value, last_scraped_at)...")
+        if not matched_records:
+            print("⚠️ Nenhum match encontrado entre DB e API\n")
+            return True
         
-        updated = self.update_base_tables(all_records)
+        # 4. Atualiza tabelas base
+        updated = self.update_base_tables(matched_records)
         
-        print("\n💾 Salvando histórico de lances na tabela auction_bid_history...")
+        # 5. Salva histórico
+        saved = self.save_bid_history(matched_records)
         
-        saved = self.save_bid_history(all_records)
-        
-        print("\n" + "="*70)
+        # 6. Resumo final
+        print("="*70)
         print("📊 RESUMO DA EXECUÇÃO")
         print("="*70)
-        print(f"📋 Itens Sodré Santoro na view: {len(self.db_items)}")
-        print(f"🎯 Lotes com lances extraídos: {len(all_matched)}")
-        print(f"🔄 Tabelas base atualizadas: {updated}")
-        print(f"💾 Registros salvos no histórico: {saved}")
+        print(f"📋 Itens no banco:        {len(self.db_items)}")
+        print(f"🔵 Lotes da API:          {len(self.api_lots)}")
+        print(f"🔗 Matches:               {len(matched_records)}")
+        print(f"📝 Tabelas atualizadas:   {updated}")
+        print(f"💾 Histórico salvo:       {saved}")
+        print(f"🔥 Itens quentes:         {len(hot_items)}")
         print("="*70)
         
-        if len(self.db_items) > 0:
-            print(f"\n📈 Taxa de extração: {(len(all_matched)/len(self.db_items)*100):.1f}%")
+        match_rate = (len(matched_records) / len(self.db_items) * 100) if self.db_items else 0
+        print(f"\n📈 Taxa de match: {match_rate:.1f}%")
         
+        if match_rate < 50:
+            print("\n⚠️ Taxa de match baixa! Possíveis causas:")
+            print("   • Links no banco podem estar em formato diferente")
+            print("   • Muitos lotes já finalizaram (não aparecem na API)")
+            print("   • Paginação não capturou todas as páginas")
+        
+        print()
         return True
 
 
-def main():
-    """Execução principal"""
+# ============================================================================
+# EXECUÇÃO PRINCIPAL
+# ============================================================================
+
+async def main():
+    """Ponto de entrada do script"""
     try:
-        monitor = SodreSantoroMonitor()
-        success = asyncio.run(monitor.run_async())
+        monitor = SodreMonitor()
+        success = await monitor.run()
         
         if success:
-            print("\n✅ Monitor executado com sucesso!")
+            print("✅ Monitor executado com sucesso!\n")
             sys.exit(0)
         else:
-            print("\n❌ Monitor falhou")
+            print("❌ Monitor falhou\n")
             sys.exit(1)
-            
+    
     except Exception as e:
-        print(f"\n❌ Erro fatal: {e}")
+        print(f"\n❌ ERRO FATAL: {e}\n")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())

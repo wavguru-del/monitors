@@ -2,7 +2,7 @@ name: Sodré Santoro Monitor
 
 on:
   schedule:
-    # Executa a cada 4 horas
+    # Executa a cada 6 horas
     - cron: '0 */6 * * *'
   
   # Permite execução manual
