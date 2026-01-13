@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MegaLeilões Monitor - Histórico de Lances (VERSÃO SIMPLIFICADA)
+MegaLeilões Monitor - Histórico de Lances (VERSÃO CORRIGIDA)
 
 MUDANÇAS:
-✅ Detecta has_bid (boolean) ao invés de total_bids (contador)
+✅ Extrai has_bid CORRETAMENTE (número > 0) usando 3 estratégias
 ✅ Salva apenas has_bid + current_value no histórico
 ✅ Atualiza tabelas base com has_bid + value
 
@@ -40,7 +40,7 @@ MEGA_CATEGORIES = [
 
 
 class MegaLeiloesMonitor:
-    """Monitor de lances MegaLeilões (VERSÃO SIMPLIFICADA)"""
+    """Monitor de lances MegaLeilões (VERSÃO CORRIGIDA)"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -105,16 +105,77 @@ class MegaLeiloesMonitor:
             print(f"❌ Erro ao carregar itens: {e}")
             return False
     
+    def extract_has_bid_robust(self, card) -> bool:
+        """
+        ✅ VERSÃO CORRIGIDA: Extrai has_bid com 3 estratégias (adaptado para Playwright)
+        
+        HTML esperado:
+        <div class="card-views-bids">
+            <span><i class="fa fa-eye"></i> 1592</span>
+            <span><i class="fa fa-legal"></i> 0</span>     <!-- Lances -->
+        </div>
+        
+        Retorna:
+            True se número de lances > 0
+            False caso contrário
+        """
+        try:
+            # Estratégia 1: Buscar o span que contém o ícone fa-legal
+            legal_span = card.query_selector('span:has(i.fa-legal)')
+            if legal_span:
+                text = legal_span.inner_text().strip()
+                numbers = re.findall(r'\d+', text)
+                if numbers:
+                    bid_count = int(numbers[0])
+                    return bid_count > 0
+            
+            # Estratégia 2: Buscar ícone e pegar texto do parent
+            legal_icon = card.query_selector('i.fa-legal')
+            if legal_icon:
+                # Em Playwright, precisamos avaluar JS para pegar o parent
+                parent_text = card.evaluate('''(card) => {
+                    const icon = card.querySelector('i.fa-legal');
+                    if (icon && icon.parentElement) {
+                        return icon.parentElement.textContent;
+                    }
+                    return null;
+                }''')
+                
+                if parent_text:
+                    numbers = re.findall(r'\d+', parent_text)
+                    if numbers:
+                        bid_count = int(numbers[0])
+                        return bid_count > 0
+            
+            # Estratégia 3: Buscar container card-views-bids
+            views_bids = card.query_selector('.card-views-bids, div[class*="views-bids"]')
+            if views_bids:
+                spans = views_bids.query_selector_all('span')
+                for span in spans:
+                    # Verifica se tem o ícone fa-legal
+                    if span.query_selector('i.fa-legal'):
+                        text = span.inner_text().strip()
+                        numbers = re.findall(r'\d+', text)
+                        if numbers:
+                            bid_count = int(numbers[0])
+                            return bid_count > 0
+            
+            return False
+            
+        except Exception as e:
+            # Em caso de erro, retorna False (sem lance)
+            return False
+    
     def extract_card_data(self, card):
         """
-        Extrai dados de um card HTML (VERSÃO SIMPLIFICADA)
+        Extrai dados de um card HTML (VERSÃO CORRIGIDA)
         
         Retorna:
             {
                 "link": str,
                 "external_id": str,
                 "current_value": float,
-                "has_bid": bool  # ✅ TRUE se encontrar ícone fa-legal
+                "has_bid": bool  # ✅ TRUE apenas se número de lances > 0
             }
         """
         try:
@@ -135,15 +196,14 @@ class MegaLeiloesMonitor:
             price_text = price_elem.inner_text().strip() if price_elem else "R$ 0"
             current_value = float(re.sub(r'[^\d,]', '', price_text).replace(',', '.')) if price_text else 0
             
-            # ✅ has_bid: TRUE se encontrar ícone fa-legal
-            legal_icon = card.query_selector('.fa-legal, i.fa-legal')
-            has_bid = legal_icon is not None
+            # ✅ has_bid: EXTRAÇÃO ROBUSTA (número > 0)
+            has_bid = self.extract_has_bid_robust(card)
             
             return {
                 "link": link,
                 "external_id": external_id,
                 "current_value": current_value,
-                "has_bid": has_bid,  # ✅ Boolean simplificado
+                "has_bid": has_bid,  # ✅ Boolean correto
             }
             
         except Exception as e:
@@ -201,7 +261,7 @@ class MegaLeiloesMonitor:
                 "source": str,
                 "external_id": str,
                 "lot_number": str,
-                "has_bid": bool,  # ✅ Boolean
+                "has_bid": bool,  # ✅ Boolean correto
                 "current_value": float,
                 "captured_at": str (ISO)
             }
@@ -221,7 +281,7 @@ class MegaLeiloesMonitor:
                 "source": db_item["source"],
                 "external_id": db_item["external_id"],
                 "lot_number": db_item["lot_number"],
-                "has_bid": item["has_bid"],  # ✅ Boolean
+                "has_bid": item["has_bid"],  # ✅ Boolean correto
                 "current_value": item["current_value"],
                 "captured_at": datetime.now().isoformat(),
             }
@@ -234,7 +294,7 @@ class MegaLeiloesMonitor:
         """
         Atualiza tabelas base com has_bid + value
         
-        ✅ MUDANÇA: Agora atualiza has_bid (boolean) ao invés de total_bids
+        ✅ MUDANÇA: Agora atualiza has_bid (boolean correto) ao invés de total_bids
         """
         if not records:
             return 0
@@ -258,7 +318,7 @@ class MegaLeiloesMonitor:
                 try:
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "has_bid": record["has_bid"],  # ✅ Boolean
+                            "has_bid": record["has_bid"],  # ✅ Boolean correto
                             "value": record["current_value"],
                             "last_scraped_at": record["captured_at"]
                         })\
@@ -286,7 +346,7 @@ class MegaLeiloesMonitor:
         """
         Salva histórico de lances em lote
         
-        ✅ MUDANÇA: Agora salva has_bid (boolean) ao invés de total_bids
+        ✅ MUDANÇA: Agora salva has_bid (boolean correto) ao invés de total_bids
         """
         if not records:
             return 0
@@ -319,7 +379,7 @@ class MegaLeiloesMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 MEGALEILÕES MONITOR - HISTÓRICO DE LANCES (VERSÃO SIMPLIFICADA)")
+        print("🔵 MEGALEILÕES MONITOR - HISTÓRICO DE LANCES (VERSÃO CORRIGIDA)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
