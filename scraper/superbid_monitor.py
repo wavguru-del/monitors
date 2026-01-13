@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperBid Monitor - Histórico de Lances
+SuperBid Monitor - Histórico de Lances (COM PAGINAÇÃO COMPLETA)
 
-FUNCIONAMENTO:
-1. Carrega TODOS os itens SuperBid ativos da view vw_auctions_unified (apenas leitura)
-2. Busca ofertas da API SuperBid (todas as categorias)
-3. Compara links da API com links do banco
-4. Para cada match:
-   - Atualiza tabelas base (total_bids, total_bidders, value, last_scraped_at)
-   - Salva histórico na tabela auction_bid_history
+✅ FIX: Agora busca TODAS as páginas de cada categoria, não só a primeira
 """
 
 import os
@@ -22,7 +16,7 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Categorias SuperBid para monitorar (usadas apenas para buscar ofertas da API)
+# Categorias SuperBid para monitorar
 SUPERBID_CATEGORIES = [
     'alimentos-e-bebidas',
     'animais',
@@ -46,7 +40,7 @@ SUPERBID_CATEGORIES = [
 
 
 class SuperBidMonitor:
-    """Monitor de lances SuperBid"""
+    """Monitor de lances SuperBid com paginação completa"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -72,7 +66,6 @@ class SuperBidMonitor:
         print("📥 Carregando itens do banco (SuperBid ativos)...")
         
         try:
-            # Supabase limita a 1000 por padrão, precisamos paginar
             page_size = 1000
             offset = 0
             total_loaded = 0
@@ -101,7 +94,6 @@ class SuperBidMonitor:
                 total_loaded += len(response.data)
                 print(f"   → Carregados {total_loaded} itens...")
                 
-                # Se retornou menos que page_size, acabou
                 if len(response.data) < page_size:
                     break
                 
@@ -114,36 +106,86 @@ class SuperBidMonitor:
             print(f"❌ Erro ao carregar itens: {e}")
             return False
     
-    def fetch_superbid_category(self, category: str, page_size: int = 100):
-        """Busca ofertas de uma categoria"""
-        try:
-            params = {
-                "urlSeo": f"https://exchange.superbid.net/categorias/{category}",
-                "locale": "pt_BR",
-                "orderBy": "score:desc",
-                "pageNumber": 1,
-                "pageSize": page_size,
-                "portalId": "[2,15]",
-                "requestOrigin": "marketplace",
-                "searchType": "openedAll",
-                "timeZoneId": "America/Sao_Paulo",
-            }
+    def fetch_superbid_category(self, category: str, page_size: int = 100, max_pages: int = 100):
+        """
+        ✅ FIX: Busca TODAS as páginas de ofertas de uma categoria
+        
+        Args:
+            category: Nome da categoria
+            page_size: Itens por página (padrão 100)
+            max_pages: Máximo de páginas a buscar (padrão 100)
             
-            response = self.session.get(
-                "https://offer-query.superbid.net/seo/offers/",
-                params=params,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                return []
-            
-            data = response.json()
-            return data.get("offers", [])
-            
-        except Exception as e:
-            print(f"⚠️ Erro em {category}: {e}")
-            return []
+        Returns:
+            Lista com todas as ofertas encontradas
+        """
+        all_offers = []
+        page_num = 1
+        consecutive_errors = 0
+        max_errors = 3
+        
+        print(f"   Buscando páginas", end='', flush=True)
+        
+        while page_num <= max_pages and consecutive_errors < max_errors:
+            try:
+                params = {
+                    "urlSeo": f"https://exchange.superbid.net/categorias/{category}",
+                    "locale": "pt_BR",
+                    "orderBy": "score:desc",
+                    "pageNumber": page_num,  # ✅ Agora incrementa!
+                    "pageSize": page_size,
+                    "portalId": "[2,15]",
+                    "requestOrigin": "marketplace",
+                    "searchType": "openedAll",
+                    "timeZoneId": "America/Sao_Paulo",
+                }
+                
+                response = self.session.get(
+                    "https://offer-query.superbid.net/seo/offers/",
+                    params=params,
+                    timeout=30
+                )
+                
+                # Status 404 = fim das páginas
+                if response.status_code == 404:
+                    break
+                
+                if response.status_code != 200:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_errors:
+                        break
+                    continue
+                
+                data = response.json()
+                offers = data.get("offers", [])
+                
+                # Página vazia = fim
+                if not offers:
+                    break
+                
+                all_offers.extend(offers)
+                print(f" {page_num}", end='', flush=True)
+                
+                # Menos que page_size = última página
+                if len(offers) < page_size:
+                    break
+                
+                page_num += 1
+                consecutive_errors = 0
+                
+            except requests.exceptions.JSONDecodeError:
+                consecutive_errors += 1
+                if consecutive_errors >= max_errors:
+                    break
+                page_num += 1
+                
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_errors:
+                    break
+                page_num += 1
+        
+        print(f" → {len(all_offers)} ofertas")
+        return all_offers
     
     def process_offer(self, offer):
         """Processa uma oferta e retorna dados para histórico"""
@@ -259,7 +301,7 @@ class SuperBidMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 SUPERBID MONITOR - HISTÓRICO DE LANCES")
+        print("🔵 SUPERBID MONITOR - HISTÓRICO DE LANCES (COM PAGINAÇÃO)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -278,9 +320,12 @@ class SuperBidMonitor:
         matched_count = 0
         total_offers = 0
         
-        print("\n🔡 Buscando ofertas da API e comparando links...\n")
+        print("\n📡 Buscando ofertas da API (TODAS as páginas)...\n")
         
         for category in SUPERBID_CATEGORIES:
+            print(f"📦 {category}")
+            
+            # ✅ Agora busca TODAS as páginas!
             offers = self.fetch_superbid_category(category)
             total_offers += len(offers)
             
@@ -295,12 +340,14 @@ class SuperBidMonitor:
             matched_count += category_matches
             
             if category_matches > 0:
-                print(f"✅ {category:45s} | {len(offers):3d} API | {category_matches:3d} matches")
+                print(f"   ✅ {len(offers)} API | {category_matches} matches")
             else:
-                print(f"⚪ {category:45s} | {len(offers):3d} API | 0 matches")
+                print(f"   ⚪ {len(offers)} API | 0 matches")
+            
+            print()  # Linha em branco entre categorias
         
         # Atualiza tabelas base
-        print("\n" + "="*70)
+        print("="*70)
         print("🔄 Atualizando tabelas base (total_bids, total_bidders, value, last_scraped_at)...")
         print("="*70)
         print()
@@ -321,17 +368,20 @@ class SuperBidMonitor:
         print("📊 RESUMO DA EXECUÇÃO")
         print("="*70)
         print(f"📋 Itens SuperBid na view: {len(self.db_items)}")
-        print(f"🔡 Ofertas retornadas da API: {total_offers}")
+        print(f"📡 Ofertas retornadas da API: {total_offers}")
         print(f"🔗 Links matched (encontrados): {matched_count}")
         print(f"🔄 Tabelas base atualizadas: {updated}")
         print(f"💾 Registros salvos no histórico: {saved}")
         print("="*70)
-        print(f"\n📈 Taxa de match: {(matched_count/len(self.db_items)*100):.1f}%")
         
-        if matched_count < len(self.db_items) * 0.1:
-            print(f"⚠️ Poucos matches! Verifique se:")
-            print(f"   - Os links no banco estão no formato correto")
-            print(f"   - As ofertas ainda estão ativas na API")
+        if len(self.db_items) > 0:
+            match_rate = (matched_count / len(self.db_items)) * 100
+            print(f"\n📈 Taxa de match: {match_rate:.1f}%")
+            
+            if match_rate < 10:
+                print(f"⚠️ Poucos matches! Verifique se:")
+                print(f"   - Os links no banco estão no formato correto")
+                print(f"   - As ofertas ainda estão ativas na API")
         
         return True
 
