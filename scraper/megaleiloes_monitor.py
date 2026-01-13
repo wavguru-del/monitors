@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MegaLeilões Monitor - Histórico de Lances
+MegaLeilões Monitor - Histórico de Lances (VERSÃO SIMPLIFICADA)
+
+MUDANÇAS:
+✅ Detecta has_bid (boolean) ao invés de total_bids (contador)
+✅ Salva apenas has_bid + current_value no histórico
+✅ Atualiza tabelas base com has_bid + value
 
 FUNCIONAMENTO:
 1. Carrega TODOS os itens MegaLeilões ativos da view vw_auctions_unified
 2. Scraping via Playwright nas 6 categorias
 3. Compara links (normaliza UTM params)
-4. Para cada match: salva histórico na tabela auction_bid_history
+4. Para cada match: salva snapshot no auction_bid_history
+5. Atualiza tabela base com has_bid + value
 """
 
 import os
 import sys
 import re
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from supabase import create_client, Client
 
@@ -34,7 +40,7 @@ MEGA_CATEGORIES = [
 
 
 class MegaLeiloesMonitor:
-    """Monitor de lances MegaLeilões"""
+    """Monitor de lances MegaLeilões (VERSÃO SIMPLIFICADA)"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -55,7 +61,7 @@ class MegaLeiloesMonitor:
     
     def load_database_items(self):
         """Carrega TODOS os itens ativos do banco indexados por link"""
-        print("📥 Carregando itens do banco (MegaLeilões ativos)...")
+        print("🔥 Carregando itens do banco (MegaLeilões ativos)...")
         
         try:
             page_size = 1000
@@ -100,7 +106,17 @@ class MegaLeiloesMonitor:
             return False
     
     def extract_card_data(self, card):
-        """Extrai dados de um card HTML"""
+        """
+        Extrai dados de um card HTML (VERSÃO SIMPLIFICADA)
+        
+        Retorna:
+            {
+                "link": str,
+                "external_id": str,
+                "current_value": float,
+                "has_bid": bool  # ✅ TRUE se encontrar ícone fa-legal
+            }
+        """
         try:
             # Link
             link_elem = card.query_selector('a.card-title')
@@ -119,20 +135,15 @@ class MegaLeiloesMonitor:
             price_text = price_elem.inner_text().strip() if price_elem else "R$ 0"
             current_value = float(re.sub(r'[^\d,]', '', price_text).replace(',', '.')) if price_text else 0
             
-            # Lances (ícone fa-legal)
-            bids_elem = card.query_selector('.card-views-bids span:has(.fa-legal)')
-            total_bids = 0
-            if bids_elem:
-                bids_text = bids_elem.inner_text().strip()
-                match = re.search(r'\d+', bids_text)
-                if match:
-                    total_bids = int(match.group())
+            # ✅ has_bid: TRUE se encontrar ícone fa-legal
+            legal_icon = card.query_selector('.fa-legal, i.fa-legal')
+            has_bid = legal_icon is not None
             
             return {
                 "link": link,
                 "external_id": external_id,
                 "current_value": current_value,
-                "total_bids": total_bids,
+                "has_bid": has_bid,  # ✅ Boolean simplificado
             }
             
         except Exception as e:
@@ -180,7 +191,22 @@ class MegaLeiloesMonitor:
         return cards_data, category_name, current_page
     
     def process_scraped_data(self, scraped_items):
-        """Processa dados scraped e faz match com banco"""
+        """
+        Processa dados scraped e faz match com banco
+        
+        Retorna lista de registros para histórico:
+        [
+            {
+                "category": str,
+                "source": str,
+                "external_id": str,
+                "lot_number": str,
+                "has_bid": bool,  # ✅ Boolean
+                "current_value": float,
+                "captured_at": str (ISO)
+            }
+        ]
+        """
         all_records = []
         
         for item in scraped_items:
@@ -195,8 +221,7 @@ class MegaLeiloesMonitor:
                 "source": db_item["source"],
                 "external_id": db_item["external_id"],
                 "lot_number": db_item["lot_number"],
-                "total_bids": item["total_bids"],
-                "total_bidders": 0,  # MegaLeilões não fornece
+                "has_bid": item["has_bid"],  # ✅ Boolean
                 "current_value": item["current_value"],
                 "captured_at": datetime.now().isoformat(),
             }
@@ -206,7 +231,11 @@ class MegaLeiloesMonitor:
         return all_records
     
     def update_base_tables(self, records):
-        """Atualiza tabelas base com dados de lances"""
+        """
+        Atualiza tabelas base com has_bid + value
+        
+        ✅ MUDANÇA: Agora atualiza has_bid (boolean) ao invés de total_bids
+        """
         if not records:
             return 0
         
@@ -229,8 +258,7 @@ class MegaLeiloesMonitor:
                 try:
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "total_bids": record["total_bids"],
-                            "total_bidders": record["total_bidders"],
+                            "has_bid": record["has_bid"],  # ✅ Boolean
                             "value": record["current_value"],
                             "last_scraped_at": record["captured_at"]
                         })\
@@ -255,23 +283,29 @@ class MegaLeiloesMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """Salva histórico de lances em lote"""
+        """
+        Salva histórico de lances em lote
+        
+        ✅ MUDANÇA: Agora salva has_bid (boolean) ao invés de total_bids
+        """
         if not records:
             return 0
         
         try:
+            # Remove duplicatas por chave única
             unique_records = {}
             for record in records:
                 key = (
                     record["category"],
                     record["source"],
                     record["external_id"],
-                    record["captured_at"][:19]
+                    record["captured_at"][:19]  # Trunca para segundos
                 )
                 unique_records[key] = record
             
             records_to_insert = list(unique_records.values())
             
+            # Upsert no histórico
             response = self.supabase.schema("auctions").table("auction_bid_history")\
                 .upsert(records_to_insert, on_conflict="category,source,external_id,captured_at")\
                 .execute()
@@ -285,7 +319,7 @@ class MegaLeiloesMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 MEGALEILÕES MONITOR - HISTÓRICO DE LANCES")
+        print("🔵 MEGALEILÕES MONITOR - HISTÓRICO DE LANCES (VERSÃO SIMPLIFICADA)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -318,38 +352,46 @@ class MegaLeiloesMonitor:
                 
                 # Calcula matches desta categoria
                 cat_matches = 0
+                cat_with_bid = 0
                 for item in cards:
                     link = self.normalize_link(item["link"])
                     if link in self.db_items:
                         cat_matches += 1
+                        if item.get("has_bid"):
+                            cat_with_bid += 1
                 
                 category_stats.append({
                     "name": cat_name,
                     "scraped": len(cards),
                     "matches": cat_matches,
+                    "with_bid": cat_with_bid,
                     "pages": pages
                 })
             
             browser.close()
         
-        # Exibe stats por categoria (formato similar ao SuperBid)
+        # Exibe stats por categoria
         for stat in category_stats:
             name = stat["name"]
             scraped = stat["scraped"]
             matches = stat["matches"]
+            with_bid = stat["with_bid"]
             pages = stat["pages"]
             
             if matches > 0:
-                print(f"✅ {name:25s} | {scraped:3d} scraped | {matches:3d} matches | {pages} pág(s)")
+                print(f"✅ {name:25s} | {scraped:3d} scraped | {matches:3d} matches | {with_bid:3d} c/ lance | {pages} pág(s)")
             else:
-                print(f"⚪ {name:25s} | {scraped:3d} scraped | 0 matches | {pages} pág(s)")
+                print(f"⚪ {name:25s} | {scraped:3d} scraped | 0 matches | 0 c/ lance | {pages} pág(s)")
         
         # Processa e salva
         all_records = self.process_scraped_data(all_scraped)
         matched_count = len(all_records)
         
+        # Conta quantos têm lance
+        with_bid_count = sum(1 for r in all_records if r.get("has_bid"))
+        
         print("\n" + "="*70)
-        print("🔄 Atualizando tabelas base (total_bids, value, last_scraped_at)...")
+        print("🔄 Atualizando tabelas base (has_bid, value, last_scraped_at)...")
         print("="*70)
         print()
         
@@ -370,6 +412,7 @@ class MegaLeiloesMonitor:
         print(f"📋 Itens MegaLeilões na view: {len(self.db_items)}")
         print(f"🌐 Ofertas scraped: {len(all_scraped)}")
         print(f"🔗 Links matched (encontrados): {matched_count}")
+        print(f"🔥 Itens com lance (has_bid=TRUE): {with_bid_count}")
         print(f"🔄 Tabelas base atualizadas: {updated}")
         print(f"💾 Registros salvos no histórico: {saved}")
         print("="*70)
