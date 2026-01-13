@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Sodré Santoro Monitor - Sistema de Detecção de Lances (CORRIGIDO)
+✅ Agora carrega TODAS as categorias (veículos, imóveis, materiais, sucatas)
 """
 
 import asyncio
@@ -18,9 +19,19 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# ✅ CORRIGIDO: Todas as categorias (igual ao scraper)
 SODRE_URLS = [
+    # VEÍCULOS
     "https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc",
-    "https://www.sodresantoro.com.br/veiculos/lotes",
+    
+    # IMÓVEIS  
+    "https://www.sodresantoro.com.br/imoveis/lotes?sort=auction_date_init_asc",
+    
+    # MATERIAIS (equipamentos, móveis, etc)
+    "https://www.sodresantoro.com.br/materiais/lotes?sort=auction_date_init_asc",
+    
+    # SUCATAS
+    "https://www.sodresantoro.com.br/sucatas/lotes?sort=auction_date_init_asc",
 ]
 
 HOT_ITEM_THRESHOLD_VALUE = 1000
@@ -48,7 +59,6 @@ class SodreMonitor:
             total_loaded = 0
             
             while True:
-                # 🔧 CORREÇÃO: Carrega também os valores atuais para comparação
                 response = self.supabase.schema("auctions").table("vw_auctions_unified")\
                     .select("link,category,source,external_id,lot_number,total_bids,total_bidders,value")\
                     .eq("source", "sodre")\
@@ -67,9 +77,9 @@ class SodreMonitor:
                             "source": item.get("source"),
                             "external_id": item.get("external_id"),
                             "lot_number": item.get("lot_number"),
-                            "prev_bid": float(item.get("value") or 0),  # 🔧 CORREÇÃO
-                            "prev_bids": int(item.get("total_bids") or 0),  # 🔧 NOVO
-                            "prev_bidders": int(item.get("total_bidders") or 0),  # 🔧 NOVO
+                            "prev_bid": float(item.get("value") or 0),
+                            "prev_bids": int(item.get("total_bids") or 0),
+                            "prev_bidders": int(item.get("total_bidders") or 0),
                         }
                 
                 total_loaded += len(response.data)
@@ -143,13 +153,19 @@ class SodreMonitor:
             
             page.on('response', intercept_response)
             
+            # ✅ MELHORADO: Log por seção
             for url in SODRE_URLS:
+                section_name = url.split('/')[3]  # veiculos, imoveis, materiais, sucatas
+                print(f"📦 {section_name.upper()}")
+                print(f"   🌐 {url}")
+                
+                lots_before = len(all_lots)
+                
                 try:
-                    print(f"📄 Carregando: {url.split('?')[0]}...")
                     await page.goto(url, wait_until="networkidle", timeout=60000)
                     await asyncio.sleep(3)
                     
-                    # Paginação automática
+                    # ✅ CORRIGIDO: 4 segundos (igual ao scraper)
                     for page_num in range(2, 51):
                         try:
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -171,15 +187,15 @@ class SodreMonitor:
                                         is_disabled = await button.get_attribute('disabled')
                                         if is_disabled is None:
                                             await button.click()
-                                            print(f"   ➡️  Navegando para página {page_num}...")
-                                            await asyncio.sleep(4)
+                                            print(f"   ➡️  Página {page_num}...")
+                                            await asyncio.sleep(4)  # ✅ 4 segundos
                                             clicked = True
                                             break
                                 except:
                                     continue
                             
                             if not clicked:
-                                print(f"   ℹ️  Paginação encerrada na página {page_num-1}")
+                                print(f"   ✅ {page_num-1} páginas processadas")
                                 break
                         
                         except Exception as e:
@@ -188,10 +204,13 @@ class SodreMonitor:
                 
                 except Exception as e:
                     print(f"   ⚠️ Erro ao carregar URL: {e}")
+                
+                lots_section = len(all_lots) - lots_before
+                print(f"   📊 {lots_section} lotes desta seção\n")
             
             await browser.close()
         
-        print(f"\n🔍 Analisando {len(all_lots)} lotes capturados...\n")
+        print(f"🔍 Analisando {len(all_lots)} lotes capturados...\n")
         
         for lot in all_lots:
             auction_id = lot.get('auction_id')
@@ -217,12 +236,11 @@ class SodreMonitor:
             if not api_data:
                 continue
             
-            # 🔧 CORREÇÃO: Extrai dados corretos da API Sodré
+            # Extrai dados da API Sodré
             current_value = float(api_data.get('bid_actual') or 0)
             has_bid = api_data.get('bid_has_bid', False)
             
-            # 🔧 NOVO: Extrai contadores de lances (se disponíveis)
-            # Nota: A API Sodré pode não ter esses campos. Se não tiver, usar 0.
+            # Extrai contadores de lances (se disponíveis)
             total_bids = int(api_data.get('bid_count') or api_data.get('total_bids') or 0)
             total_bidders = int(api_data.get('bidder_count') or api_data.get('total_bidders') or 0)
             
@@ -233,13 +251,13 @@ class SodreMonitor:
             
             bid_delta = total_bids - db_data['prev_bids']
             
-            # 🔧 CORREÇÃO: Prepara registro com nomes corretos dos campos
+            # Prepara registro
             record = {
                 "category": db_data["category"],
                 "source": db_data["source"],
                 "external_id": db_data["external_id"],
                 "lot_number": db_data["lot_number"],
-                # ⭐ CAMPOS PARA auction_bid_history (conforme documentação)
+                # Campos para auction_bid_history
                 "total_bids": total_bids,
                 "total_bidders": total_bidders,
                 "current_value": current_value,
@@ -286,15 +304,7 @@ class SodreMonitor:
         return matched_records, hot_items
     
     def update_base_tables(self, records):
-        """
-        🔧 CORREÇÃO: Atualiza tabelas base com os campos corretos
-        
-        Campos Sodré nas tabelas base:
-        - value (não bid_actual)
-        - total_bids
-        - total_bidders
-        - last_scraped_at
-        """
+        """Atualiza tabelas base com os campos corretos"""
         if not records:
             return 0
         
@@ -307,7 +317,7 @@ class SodreMonitor:
                 by_category[cat] = []
             by_category[cat].append(record)
         
-        print("📝 Atualizando tabelas base...\n")
+        print("🔄 Atualizando tabelas base...\n")
         
         for category, cat_records in by_category.items():
             cat_updated = 0
@@ -315,10 +325,9 @@ class SodreMonitor:
             
             for record in cat_records:
                 try:
-                    # ⭐ CORREÇÃO: Usa os nomes corretos dos campos da tabela base
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "value": record["current_value"],  # 🔧 value, não bid_actual
+                            "value": record["current_value"],
                             "total_bids": record["total_bids"],
                             "total_bidders": record["total_bidders"],
                             "last_scraped_at": record["captured_at"]
@@ -345,14 +354,7 @@ class SodreMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """
-        🔧 CORREÇÃO: Salva histórico com os campos corretos
-        
-        Campos da tabela auction_bid_history:
-        - category, source, external_id, lot_number
-        - total_bids, total_bidders, current_value
-        - captured_at
-        """
+        """Salva histórico com os campos corretos"""
         if not records:
             return 0
         
@@ -432,7 +434,7 @@ class SodreMonitor:
         print(f"📋 Itens no banco:        {len(self.db_items)}")
         print(f"🔵 Lotes da API:          {len(self.api_lots)}")
         print(f"🔗 Matches:               {len(matched_records)}")
-        print(f"📝 Tabelas atualizadas:   {updated}")
+        print(f"🔄 Tabelas atualizadas:   {updated}")
         print(f"💾 Histórico salvo:       {saved}")
         print(f"🔥 Itens quentes:         {len(hot_items)}")
         print("="*70)
