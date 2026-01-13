@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sodré Santoro Monitor - Sistema de Detecção de Lances (CORRIGIDO)
-✅ Agora carrega TODAS as categorias (veículos, imóveis, materiais, sucatas)
+Sodré Santoro Monitor - Detecção de Lances (CORRIGIDO)
+✅ Usa mesma lógica do scraper (só leilões ativos)
+✅ Carrega itens do banco E captura dados atuais da API
+✅ Cruza os dois para detectar mudanças
 """
 
 import asyncio
@@ -19,18 +21,11 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ✅ CORRIGIDO: Todas as categorias (igual ao scraper)
+# ✅ URLs IGUAIS AO SCRAPER (só leilões ativos, ordenados por data)
 SODRE_URLS = [
-    # VEÍCULOS
     "https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc",
-    
-    # IMÓVEIS  
     "https://www.sodresantoro.com.br/imoveis/lotes?sort=auction_date_init_asc",
-    
-    # MATERIAIS (equipamentos, móveis, etc)
     "https://www.sodresantoro.com.br/materiais/lotes?sort=auction_date_init_asc",
-    
-    # SUCATAS
     "https://www.sodresantoro.com.br/sucatas/lotes?sort=auction_date_init_asc",
 ]
 
@@ -105,7 +100,10 @@ class SodreMonitor:
             return False
     
     async def intercept_sodre_data(self):
-        """Intercepta dados da API Sodré usando Playwright"""
+        """
+        Intercepta dados da API Sodré usando Playwright
+        ✅ IGUAL AO SCRAPER: Só páginas ativas, para quando não há mais botão
+        """
         print("🌐 Iniciando interceptação Playwright...\n")
         
         all_lots = []
@@ -142,20 +140,18 @@ class SodreMonitor:
                             
                             if results:
                                 all_lots.extend(results)
-                                print(f"   ✓ Capturados {len(results)} lotes - Total: {len(all_lots)}")
                             elif hits:
                                 extracted = [hit.get('_source', hit) for hit in hits]
                                 all_lots.extend(extracted)
-                                print(f"   ✓ Capturados {len(hits)} lotes - Total: {len(all_lots)}")
                 
                 except Exception:
                     pass
             
             page.on('response', intercept_response)
             
-            # ✅ MELHORADO: Log por seção
+            # ✅ NAVEGA IGUAL AO SCRAPER
             for url in SODRE_URLS:
-                section_name = url.split('/')[3]  # veiculos, imoveis, materiais, sucatas
+                section_name = url.split('/')[3]
                 print(f"📦 {section_name.upper()}")
                 print(f"   🌐 {url}")
                 
@@ -165,7 +161,7 @@ class SodreMonitor:
                     await page.goto(url, wait_until="networkidle", timeout=60000)
                     await asyncio.sleep(3)
                     
-                    # ✅ CORRIGIDO: 4 segundos (igual ao scraper)
+                    # ✅ PAGINAÇÃO IGUAL AO SCRAPER (para quando botão disabled)
                     for page_num in range(2, 51):
                         try:
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -174,9 +170,7 @@ class SodreMonitor:
                             selectors = [
                                 'button[title="Avançar"]:not([disabled])',
                                 'button[title*="Avanç"]:not([disabled])',
-                                'button[aria-label*="Avanç"]:not([disabled])',
                                 'button:has(.i-mdi\\:chevron-right):not([disabled])',
-                                'nav[aria-label*="Paginação"] button:last-child:not([disabled])',
                             ]
                             
                             clicked = False
@@ -188,7 +182,7 @@ class SodreMonitor:
                                         if is_disabled is None:
                                             await button.click()
                                             print(f"   ➡️  Página {page_num}...")
-                                            await asyncio.sleep(4)  # ✅ 4 segundos
+                                            await asyncio.sleep(4)
                                             clicked = True
                                             break
                                 except:
@@ -199,7 +193,6 @@ class SodreMonitor:
                                 break
                         
                         except Exception as e:
-                            print(f"   ⚠️  Erro na paginação (página {page_num}): {e}")
                             break
                 
                 except Exception as e:
@@ -210,8 +203,10 @@ class SodreMonitor:
             
             await browser.close()
         
-        print(f"🔍 Analisando {len(all_lots)} lotes capturados...\n")
+        print(f"📊 {len(all_lots)} lotes capturados da API")
+        print(f"🔍 Indexando por link...\n")
         
+        # Indexa por link
         for lot in all_lots:
             auction_id = lot.get('auction_id')
             lot_id = lot.get('lot_id')
@@ -240,7 +235,7 @@ class SodreMonitor:
             current_value = float(api_data.get('bid_actual') or 0)
             has_bid = api_data.get('bid_has_bid', False)
             
-            # Extrai contadores de lances (se disponíveis)
+            # Contadores de lances
             total_bids = int(api_data.get('bid_count') or api_data.get('total_bids') or 0)
             total_bidders = int(api_data.get('bidder_count') or api_data.get('total_bidders') or 0)
             
@@ -275,7 +270,7 @@ class SodreMonitor:
             is_hot = (
                 value_delta >= HOT_ITEM_THRESHOLD_VALUE or 
                 value_increase_pct >= HOT_ITEM_THRESHOLD_PERCENT or
-                bid_delta >= 5  # Pico de lances
+                bid_delta >= 5
             )
             
             if is_hot:
@@ -341,7 +336,7 @@ class SodreMonitor:
                     
                 except Exception as e:
                     cat_errors += 1
-                    if cat_errors <= 3:  # Mostra apenas os 3 primeiros erros
+                    if cat_errors <= 3:
                         print(f"   ⚠️  Erro em {category}: {e}")
                     continue
             
