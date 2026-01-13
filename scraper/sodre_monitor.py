@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sodré Santoro Monitor - Detecção de Lances (CORRIGIDO)
-✅ Usa mesma lógica do scraper (só leilões ativos)
-✅ Carrega itens do banco E captura dados atuais da API
-✅ Cruza os dois para detectar mudanças
+Sodré Santoro Monitor - Detecção de Lances (VERSÃO SIMPLIFICADA)
+✅ Usa has_bid (boolean) ao invés de total_bids
+✅ API Sodré retorna bid_has_bid diretamente
+✅ Salva apenas has_bid + current_value no histórico
 """
 
 import asyncio
@@ -21,7 +21,6 @@ from supabase import create_client, Client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# ✅ URLs IGUAIS AO SCRAPER (só leilões ativos, ordenados por data)
 SODRE_URLS = [
     "https://www.sodresantoro.com.br/veiculos/lotes?sort=auction_date_init_asc",
     "https://www.sodresantoro.com.br/imoveis/lotes?sort=auction_date_init_asc",
@@ -34,7 +33,7 @@ HOT_ITEM_THRESHOLD_PERCENT = 20
 
 
 class SodreMonitor:
-    """Monitor de lances Sodré Santoro com detecção de padrões"""
+    """Monitor de lances Sodré Santoro (VERSÃO SIMPLIFICADA)"""
     
     def __init__(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -45,8 +44,8 @@ class SodreMonitor:
         self.api_lots = {}
     
     def load_database_items(self):
-        """Carrega TODOS os itens Sodré Santoro ativos do banco"""
-        print("📥 Carregando itens do banco (Sodré Santoro ativos)...")
+        """Carrega itens Sodré Santoro ativos do banco"""
+        print("🔥 Carregando itens do banco (Sodré Santoro ativos)...")
         
         try:
             page_size = 1000
@@ -55,7 +54,7 @@ class SodreMonitor:
             
             while True:
                 response = self.supabase.schema("auctions").table("vw_auctions_unified")\
-                    .select("link,category,source,external_id,lot_number,total_bids,total_bidders,value")\
+                    .select("link,category,source,external_id,lot_number,has_bid,value")\
                     .eq("source", "sodre")\
                     .eq("is_active", True)\
                     .range(offset, offset + page_size - 1)\
@@ -72,9 +71,8 @@ class SodreMonitor:
                             "source": item.get("source"),
                             "external_id": item.get("external_id"),
                             "lot_number": item.get("lot_number"),
-                            "prev_bid": float(item.get("value") or 0),
-                            "prev_bids": int(item.get("total_bids") or 0),
-                            "prev_bidders": int(item.get("total_bidders") or 0),
+                            "prev_has_bid": item.get("has_bid", False),  # ✅ Boolean
+                            "prev_value": float(item.get("value") or 0),
                         }
                 
                 total_loaded += len(response.data)
@@ -85,14 +83,7 @@ class SodreMonitor:
                 
                 offset += page_size
             
-            print(f"✅ {len(self.db_items)} itens Sodré carregados da view")
-            
-            if self.db_items:
-                print(f"\n📋 Exemplos de links no banco:")
-                for i, link in enumerate(list(self.db_items.keys())[:3]):
-                    print(f"   {i+1}. {link}")
-                print()
-            
+            print(f"✅ {len(self.db_items)} itens Sodré carregados\n")
             return True
             
         except Exception as e:
@@ -100,31 +91,18 @@ class SodreMonitor:
             return False
     
     async def intercept_sodre_data(self):
-        """
-        Intercepta dados da API Sodré usando Playwright
-        ✅ IGUAL AO SCRAPER: Só páginas ativas, para quando não há mais botão
-        """
+        """Intercepta dados da API Sodré"""
         print("🌐 Iniciando interceptação Playwright...\n")
         
         all_lots = []
         
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--disable-blink-features=AutomationControlled']
-            )
-            
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 locale='pt-BR'
             )
-            
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
             
             page = await context.new_page()
             
@@ -144,66 +122,42 @@ class SodreMonitor:
                                 extracted = [hit.get('_source', hit) for hit in hits]
                                 all_lots.extend(extracted)
                 
-                except Exception:
+                except:
                     pass
             
             page.on('response', intercept_response)
             
-            # ✅ NAVEGA IGUAL AO SCRAPER
             for url in SODRE_URLS:
                 section_name = url.split('/')[3]
                 print(f"📦 {section_name.upper()}")
-                print(f"   🌐 {url}")
-                
-                lots_before = len(all_lots)
                 
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=60000)
                     await asyncio.sleep(3)
                     
-                    # ✅ PAGINAÇÃO IGUAL AO SCRAPER (para quando botão disabled)
+                    # Paginação
                     for page_num in range(2, 51):
                         try:
                             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                             await asyncio.sleep(2)
                             
-                            selectors = [
-                                'button[title="Avançar"]:not([disabled])',
-                                'button[title*="Avanç"]:not([disabled])',
-                                'button:has(.i-mdi\\:chevron-right):not([disabled])',
-                            ]
-                            
-                            clicked = False
-                            for selector in selectors:
-                                try:
-                                    button = page.locator(selector).first
-                                    if await button.count() > 0:
-                                        is_disabled = await button.get_attribute('disabled')
-                                        if is_disabled is None:
-                                            await button.click()
-                                            print(f"   ➡️  Página {page_num}...")
-                                            await asyncio.sleep(4)
-                                            clicked = True
-                                            break
-                                except:
-                                    continue
-                            
-                            if not clicked:
-                                print(f"   ✅ {page_num-1} páginas processadas")
+                            button = page.locator('button[title="Avançar"]:not([disabled])').first
+                            if await button.count() > 0:
+                                await button.click()
+                                print(f"   ➡️  Página {page_num}...")
+                                await asyncio.sleep(4)
+                            else:
+                                print(f"   ✅ {page_num-1} páginas")
                                 break
-                        
-                        except Exception as e:
+                        except:
                             break
                 
                 except Exception as e:
-                    print(f"   ⚠️ Erro ao carregar URL: {e}")
-                
-                lots_section = len(all_lots) - lots_before
-                print(f"   📊 {lots_section} lotes desta seção\n")
+                    print(f"   ⚠️ Erro: {e}")
             
             await browser.close()
         
-        print(f"📊 {len(all_lots)} lotes capturados da API")
+        print(f"\n📊 {len(all_lots)} lotes capturados")
         print(f"🔍 Indexando por link...\n")
         
         # Indexa por link
@@ -219,11 +173,12 @@ class SodreMonitor:
         return len(self.api_lots) > 0
     
     def cross_reference_data(self):
-        """Cruza dados do banco com dados da API"""
+        """Cruza dados do banco com API"""
         print("🔗 Cruzando dados (DB ↔ API)...\n")
         
         matched_records = []
         hot_items = []
+        new_bids = []  # ✅ Itens que ganharam lance
         
         for link, db_data in self.db_items.items():
             api_data = self.api_lots.get(link)
@@ -231,20 +186,19 @@ class SodreMonitor:
             if not api_data:
                 continue
             
-            # Extrai dados da API Sodré
+            # ✅ Dados da API (SIMPLIFICADO)
             current_value = float(api_data.get('bid_actual') or 0)
-            has_bid = api_data.get('bid_has_bid', False)
-            
-            # Contadores de lances
-            total_bids = int(api_data.get('bid_count') or api_data.get('total_bids') or 0)
-            total_bidders = int(api_data.get('bidder_count') or api_data.get('total_bidders') or 0)
+            has_bid = api_data.get('bid_has_bid', False)  # ✅ Boolean direto
             
             # Calcula variações
-            prev_value = db_data['prev_bid']
+            prev_value = db_data['prev_value']
+            prev_has_bid = db_data['prev_has_bid']
+            
             value_delta = current_value - prev_value
             value_increase_pct = (value_delta / prev_value * 100) if prev_value > 0 else 0
             
-            bid_delta = total_bids - db_data['prev_bids']
+            # ✅ Detecta NOVO LANCE (FALSE → TRUE)
+            gained_bid = (not prev_has_bid) and has_bid
             
             # Prepara registro
             record = {
@@ -252,16 +206,16 @@ class SodreMonitor:
                 "source": db_data["source"],
                 "external_id": db_data["external_id"],
                 "lot_number": db_data["lot_number"],
-                # Campos para auction_bid_history
-                "total_bids": total_bids,
-                "total_bidders": total_bidders,
+                
+                # ✅ Campos para auction_bid_history (SIMPLIFICADO)
+                "has_bid": has_bid,
                 "current_value": current_value,
                 "captured_at": datetime.now().isoformat(),
+                
                 # Metadados para análise
                 "_value_delta": value_delta,
                 "_value_increase_pct": value_increase_pct,
-                "_bid_delta": bid_delta,
-                "_has_bid": has_bid,
+                "_gained_bid": gained_bid,
             }
             
             matched_records.append(record)
@@ -270,7 +224,7 @@ class SodreMonitor:
             is_hot = (
                 value_delta >= HOT_ITEM_THRESHOLD_VALUE or 
                 value_increase_pct >= HOT_ITEM_THRESHOLD_PERCENT or
-                bid_delta >= 5
+                gained_bid  # ✅ Ganhou lance = quente!
             )
             
             if is_hot:
@@ -278,9 +232,24 @@ class SodreMonitor:
                     **record,
                     "lot_title": f"{api_data.get('lot_brand', '')} {api_data.get('lot_model', '')}".strip(),
                 })
+            
+            if gained_bid:
+                new_bids.append(record)
         
         print(f"✅ {len(matched_records)} matches encontrados\n")
         
+        # ✅ Mostra itens que ganharam lance
+        if new_bids:
+            print(f"{'='*70}")
+            print(f"🔥 {len(new_bids)} ITENS GANHARAM LANCE (FALSE → TRUE)!")
+            print(f"{'='*70}\n")
+            
+            for i, item in enumerate(new_bids[:5], 1):
+                print(f"{i}. 🆕 Lote {item['lot_number']}")
+                print(f"      Valor: R$ {item['current_value']:,.2f}")
+                print()
+        
+        # Mostra itens quentes
         if hot_items:
             print(f"{'='*70}")
             print(f"🔥 {len(hot_items)} ITENS QUENTES DETECTADOS!")
@@ -288,18 +257,18 @@ class SodreMonitor:
             
             hot_items.sort(key=lambda x: x.get('_value_increase_pct', 0), reverse=True)
             
-            for i, item in enumerate(hot_items[:10], 1):
-                print(f"{i:2d}. 🚨 Lote {item['lot_number']}: {item['lot_title']}")
+            for i, item in enumerate(hot_items[:5], 1):
+                print(f"{i}. 🚨 Lote {item['lot_number']}: {item['lot_title']}")
                 print(f"      Valor: R$ {item['current_value']:,.2f} "
                       f"(+R$ {item['_value_delta']:,.2f} / +{item['_value_increase_pct']:.1f}%)")
-                if item['_bid_delta'] > 0:
-                    print(f"      Lances: {item['total_bids']} (+{item['_bid_delta']})")
+                if item['_gained_bid']:
+                    print(f"      🆕 GANHOU LANCE!")
                 print()
         
         return matched_records, hot_items
     
     def update_base_tables(self, records):
-        """Atualiza tabelas base com os campos corretos"""
+        """Atualiza tabelas base com has_bid + value"""
         if not records:
             return 0
         
@@ -320,11 +289,11 @@ class SodreMonitor:
             
             for record in cat_records:
                 try:
+                    # ✅ Atualiza apenas has_bid, value e last_scraped_at
                     self.supabase.schema("auctions").table(category)\
                         .update({
+                            "has_bid": record["has_bid"],  # ✅ Boolean
                             "value": record["current_value"],
-                            "total_bids": record["total_bids"],
-                            "total_bidders": record["total_bidders"],
                             "last_scraped_at": record["captured_at"]
                         })\
                         .eq("source", record["source"])\
@@ -336,8 +305,6 @@ class SodreMonitor:
                     
                 except Exception as e:
                     cat_errors += 1
-                    if cat_errors <= 3:
-                        print(f"   ⚠️  Erro em {category}: {e}")
                     continue
             
             if cat_updated > 0:
@@ -349,7 +316,7 @@ class SodreMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """Salva histórico com os campos corretos"""
+        """Salva histórico (SIMPLIFICADO)"""
         if not records:
             return 0
         
@@ -362,8 +329,7 @@ class SodreMonitor:
                     "source": record["source"],
                     "external_id": record["external_id"],
                     "lot_number": record["lot_number"],
-                    "total_bids": record["total_bids"],
-                    "total_bidders": record["total_bidders"],
+                    "has_bid": record["has_bid"],  # ✅ Boolean
                     "current_value": record["current_value"],
                     "captured_at": record["captured_at"]
                 }
@@ -397,7 +363,7 @@ class SodreMonitor:
     async def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 SODRÉ SANTORO MONITOR - DETECÇÃO DE LANCES")
+        print("🔵 SODRÉ SANTORO MONITOR - DETECÇÃO DE LANCES (SIMPLIFICADO)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -435,15 +401,8 @@ class SodreMonitor:
         print("="*70)
         
         match_rate = (len(matched_records) / len(self.db_items) * 100) if self.db_items else 0
-        print(f"\n📈 Taxa de match: {match_rate:.1f}%")
+        print(f"\n📈 Taxa de match: {match_rate:.1f}%\n")
         
-        if match_rate < 50:
-            print("\n⚠️ Taxa de match baixa! Possíveis causas:")
-            print("   • Links no banco podem estar em formato diferente")
-            print("   • Muitos lotes já finalizaram")
-            print("   • Paginação não capturou todas as páginas")
-        
-        print()
         return True
 
 
