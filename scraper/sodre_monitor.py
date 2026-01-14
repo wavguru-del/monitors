@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sodré Santoro Monitor - Detecção de Lances (VERSÃO SIMPLIFICADA)
+Sodré Santoro Monitor - Detecção de Lances (VERSÃO FINAL)
 ✅ Usa has_bid (boolean) ao invés de total_bids
 ✅ API Sodré retorna bid_has_bid diretamente
 ✅ Salva apenas has_bid + current_value no histórico
+✅ Atualiza view de oportunidades após cada execução
 """
 
 import asyncio
@@ -33,7 +34,7 @@ HOT_ITEM_THRESHOLD_PERCENT = 20
 
 
 class SodreMonitor:
-    """Monitor de lances Sodré Santoro (VERSÃO SIMPLIFICADA)"""
+    """Monitor de lances Sodré Santoro (VERSÃO FINAL)"""
     
     def __init__(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -45,7 +46,7 @@ class SodreMonitor:
     
     def load_database_items(self):
         """Carrega itens Sodré Santoro ativos do banco"""
-        print("🔥 Carregando itens do banco (Sodré Santoro ativos)...")
+        print("📥 Carregando itens do banco (Sodré Santoro ativos)...")
         
         try:
             page_size = 1000
@@ -71,7 +72,7 @@ class SodreMonitor:
                             "source": item.get("source"),
                             "external_id": item.get("external_id"),
                             "lot_number": item.get("lot_number"),
-                            "prev_has_bid": item.get("has_bid", False),  # ✅ Boolean
+                            "prev_has_bid": item.get("has_bid", False),
                             "prev_value": float(item.get("value") or 0),
                         }
                 
@@ -178,7 +179,7 @@ class SodreMonitor:
         
         matched_records = []
         hot_items = []
-        new_bids = []  # ✅ Itens que ganharam lance
+        new_bids = []
         
         for link, db_data in self.db_items.items():
             api_data = self.api_lots.get(link)
@@ -186,9 +187,9 @@ class SodreMonitor:
             if not api_data:
                 continue
             
-            # ✅ Dados da API (SIMPLIFICADO)
+            # Dados da API
             current_value = float(api_data.get('bid_actual') or 0)
-            has_bid = api_data.get('bid_has_bid', False)  # ✅ Boolean direto
+            has_bid = api_data.get('bid_has_bid', False)
             
             # Calcula variações
             prev_value = db_data['prev_value']
@@ -197,7 +198,7 @@ class SodreMonitor:
             value_delta = current_value - prev_value
             value_increase_pct = (value_delta / prev_value * 100) if prev_value > 0 else 0
             
-            # ✅ Detecta NOVO LANCE (FALSE → TRUE)
+            # Detecta NOVO LANCE (FALSE → TRUE)
             gained_bid = (not prev_has_bid) and has_bid
             
             # Prepara registro
@@ -207,7 +208,7 @@ class SodreMonitor:
                 "external_id": db_data["external_id"],
                 "lot_number": db_data["lot_number"],
                 
-                # ✅ Campos para auction_bid_history (SIMPLIFICADO)
+                # Campos para auction_bid_history
                 "has_bid": has_bid,
                 "current_value": current_value,
                 "captured_at": datetime.now().isoformat(),
@@ -224,7 +225,7 @@ class SodreMonitor:
             is_hot = (
                 value_delta >= HOT_ITEM_THRESHOLD_VALUE or 
                 value_increase_pct >= HOT_ITEM_THRESHOLD_PERCENT or
-                gained_bid  # ✅ Ganhou lance = quente!
+                gained_bid
             )
             
             if is_hot:
@@ -238,7 +239,7 @@ class SodreMonitor:
         
         print(f"✅ {len(matched_records)} matches encontrados\n")
         
-        # ✅ Mostra itens que ganharam lance
+        # Mostra itens que ganharam lance
         if new_bids:
             print(f"{'='*70}")
             print(f"🔥 {len(new_bids)} ITENS GANHARAM LANCE (FALSE → TRUE)!")
@@ -281,7 +282,7 @@ class SodreMonitor:
                 by_category[cat] = []
             by_category[cat].append(record)
         
-        print("🔄 Atualizando tabelas base...\n")
+        print("📄 Atualizando tabelas base...\n")
         
         for category, cat_records in by_category.items():
             cat_updated = 0
@@ -289,10 +290,9 @@ class SodreMonitor:
             
             for record in cat_records:
                 try:
-                    # ✅ Atualiza apenas has_bid, value e last_scraped_at
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "has_bid": record["has_bid"],  # ✅ Boolean
+                            "has_bid": record["has_bid"],
                             "value": record["current_value"],
                             "last_scraped_at": record["captured_at"]
                         })\
@@ -316,12 +316,12 @@ class SodreMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """Salva histórico (SIMPLIFICADO)"""
+        """Salva histórico"""
         if not records:
             return 0
         
         try:
-            # Remove metadados internos (_*)
+            # Remove metadados internos
             clean_records = []
             for record in records:
                 clean = {
@@ -329,7 +329,7 @@ class SodreMonitor:
                     "source": record["source"],
                     "external_id": record["external_id"],
                     "lot_number": record["lot_number"],
-                    "has_bid": record["has_bid"],  # ✅ Boolean
+                    "has_bid": record["has_bid"],
                     "current_value": record["current_value"],
                     "captured_at": record["captured_at"]
                 }
@@ -363,7 +363,7 @@ class SodreMonitor:
     async def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 SODRÉ SANTORO MONITOR - DETECÇÃO DE LANCES (SIMPLIFICADO)")
+        print("🔵 SODRÉ SANTORO MONITOR - DETECÇÃO DE LANCES")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -395,13 +395,24 @@ class SodreMonitor:
         print(f"📋 Itens no banco:        {len(self.db_items)}")
         print(f"🔵 Lotes da API:          {len(self.api_lots)}")
         print(f"🔗 Matches:               {len(matched_records)}")
-        print(f"🔄 Tabelas atualizadas:   {updated}")
+        print(f"📄 Tabelas atualizadas:   {updated}")
         print(f"💾 Histórico salvo:       {saved}")
         print(f"🔥 Itens quentes:         {len(hot_items)}")
         print("="*70)
         
         match_rate = (len(matched_records) / len(self.db_items) * 100) if self.db_items else 0
         print(f"\n📈 Taxa de match: {match_rate:.1f}%\n")
+        
+        # ✅ ATUALIZA VIEW DE OPORTUNIDADES
+        print("="*70)
+        print("🔄 Atualizando view de oportunidades...")
+        print("="*70)
+        
+        try:
+            self.supabase.rpc('refresh_opportunities').execute()
+            print("✅ View vw_opportunities atualizada com sucesso!\n")
+        except Exception as e:
+            print(f"⚠️ Erro ao atualizar view: {e}\n")
         
         return True
 

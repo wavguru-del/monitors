@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperBid Monitor - Versão Simplificada (has_bid)
+SuperBid Monitor - Versão Final com Refresh
 
 ✅ Atualiza tabelas base com has_bid (boolean)
 ✅ Salva snapshots no histórico (auction_bid_history)
 ✅ Paginação completa de todas as categorias
+✅ Atualiza view de oportunidades após cada execução
 """
 
 import os
@@ -42,7 +43,7 @@ SUPERBID_CATEGORIES = [
 
 
 class SuperBidMonitor:
-    """Monitor de lances SuperBid com estrutura simplificada"""
+    """Monitor de lances SuperBid (VERSÃO FINAL)"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -60,7 +61,6 @@ class SuperBidMonitor:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         })
         
-        # Cache: {link: {category, source, external_id, lot_number}}
         self.db_items = {}
     
     def load_database_items(self):
@@ -109,17 +109,7 @@ class SuperBidMonitor:
             return False
     
     def fetch_superbid_category(self, category: str, page_size: int = 100, max_pages: int = 100):
-        """
-        Busca TODAS as páginas de ofertas de uma categoria
-        
-        Args:
-            category: Nome da categoria
-            page_size: Itens por página (padrão 100)
-            max_pages: Máximo de páginas a buscar (padrão 100)
-            
-        Returns:
-            Lista com todas as ofertas encontradas
-        """
+        """Busca TODAS as páginas de ofertas de uma categoria"""
         all_offers = []
         page_num = 1
         consecutive_errors = 0
@@ -147,7 +137,6 @@ class SuperBidMonitor:
                     timeout=30
                 )
                 
-                # Status 404 = fim das páginas
                 if response.status_code == 404:
                     break
                 
@@ -160,14 +149,12 @@ class SuperBidMonitor:
                 data = response.json()
                 offers = data.get("offers", [])
                 
-                # Página vazia = fim
                 if not offers:
                     break
                 
                 all_offers.extend(offers)
                 print(f" {page_num}", end='', flush=True)
                 
-                # Menos que page_size = última página
                 if len(offers) < page_size:
                     break
                 
@@ -195,55 +182,40 @@ class SuperBidMonitor:
         if not offer_id:
             return None
         
-        # Monta URL da oferta
         link = f"https://exchange.superbid.net/oferta/{offer_id}"
         
-        # Verifica se esse link existe no banco
         db_item = self.db_items.get(link)
         if not db_item:
             return None
         
-        # ✅ NOVA ESTRUTURA: Extrai has_bid (boolean) da API
+        # Extrai has_bid (boolean) da API
         total_bids = offer.get("totalBids", 0)
-        has_bid = total_bids > 0  # Converte contador em boolean
+        has_bid = total_bids > 0
         
         # Extrai valor atual
         detail = offer.get("offerDetail", {})
         current_value = detail.get("currentMinBid") or detail.get("initialBidValue")
         
-        # Timestamp da captura
         captured_at = datetime.now().isoformat()
         
-        # Retorna dados combinados
         return {
-            # Identificação (do banco)
             "category": db_item["category"],
             "source": db_item["source"],
             "external_id": db_item["external_id"],
             "lot_number": db_item["lot_number"],
-            
-            # Dados de lance (da API) - ✅ SIMPLIFICADO
             "has_bid": has_bid,
             "current_value": current_value,
             "captured_at": captured_at,
         }
     
     def update_base_tables(self, records):
-        """
-        Atualiza tabelas base com has_bid e valor atual
-        
-        Campos atualizados:
-        - has_bid (boolean)
-        - value (numeric)
-        - last_scraped_at (timestamp)
-        """
+        """Atualiza tabelas base com has_bid e valor atual"""
         if not records:
             return 0
         
         updated_count = 0
         errors = 0
         
-        # Agrupa por categoria para logs organizados
         by_category = {}
         for record in records:
             cat = record["category"]
@@ -258,7 +230,6 @@ class SuperBidMonitor:
             
             for record in cat_records:
                 try:
-                    # ✅ Atualiza apenas has_bid, value e last_scraped_at
                     self.supabase.schema("auctions").table(category)\
                         .update({
                             "has_bid": record["has_bid"],
@@ -277,7 +248,6 @@ class SuperBidMonitor:
                     errors += 1
                     continue
             
-            # Log por categoria
             if cat_updated > 0:
                 print(f"✅ {category:45s} | {cat_updated:3d} atualizados | {cat_errors:2d} erros")
             elif cat_errors > 0:
@@ -286,21 +256,11 @@ class SuperBidMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """
-        Salva snapshots no histórico
-        
-        Tabela: auction_bid_history
-        Campos:
-        - category, source, external_id, lot_number (identificação)
-        - has_bid (boolean)
-        - current_value (numeric)
-        - captured_at (timestamp)
-        """
+        """Salva snapshots no histórico"""
         if not records:
             return 0
         
         try:
-            # Prepara registros para inserção no histórico
             history_records = []
             
             for record in records:
@@ -309,25 +269,24 @@ class SuperBidMonitor:
                     "source": record["source"],
                     "external_id": record["external_id"],
                     "lot_number": record["lot_number"],
-                    "has_bid": record["has_bid"],  # ✅ Boolean
+                    "has_bid": record["has_bid"],
                     "current_value": record["current_value"],
                     "captured_at": record["captured_at"]
                 })
             
-            # Remove duplicatas baseado em chave única
+            # Remove duplicatas
             unique_records = {}
             for record in history_records:
                 key = (
                     record["category"],
                     record["source"],
                     record["external_id"],
-                    record["captured_at"][:19]  # Trunca para segundos
+                    record["captured_at"][:19]
                 )
                 unique_records[key] = record
             
             records_to_insert = list(unique_records.values())
             
-            # Insere em lote (upsert para evitar duplicatas)
             response = self.supabase.schema("auctions").table("auction_bid_history")\
                 .upsert(
                     records_to_insert,
@@ -344,12 +303,11 @@ class SuperBidMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 SUPERBID MONITOR - VERSÃO SIMPLIFICADA (has_bid)")
+        print("🔵 SUPERBID MONITOR - VERSÃO FINAL")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
         
-        # Carrega itens do banco
         if not self.load_database_items():
             print("❌ Falha ao carregar itens do banco")
             return False
@@ -368,7 +326,6 @@ class SuperBidMonitor:
         for category in SUPERBID_CATEGORIES:
             print(f"📦 {category}")
             
-            # Busca TODAS as páginas
             offers = self.fetch_superbid_category(category)
             total_offers += len(offers)
             
@@ -387,7 +344,7 @@ class SuperBidMonitor:
             else:
                 print(f"   ⚪ {len(offers)} API | 0 matches")
             
-            print()  # Linha em branco entre categorias
+            print()
         
         # Atualiza tabelas base
         print("="*70)
@@ -426,6 +383,17 @@ class SuperBidMonitor:
                 print(f"   - Os links no banco estão no formato correto")
                 print(f"   - As ofertas ainda estão ativas na API")
         
+        # ✅ ATUALIZA VIEW DE OPORTUNIDADES
+        print("\n" + "="*70)
+        print("🔄 Atualizando view de oportunidades...")
+        print("="*70)
+        
+        try:
+            self.supabase.rpc('refresh_opportunities').execute()
+            print("✅ View vw_opportunities atualizada com sucesso!\n")
+        except Exception as e:
+            print(f"⚠️ Erro ao atualizar view: {e}\n")
+        
         return True
 
 
@@ -436,10 +404,10 @@ def main():
         success = monitor.run()
         
         if success:
-            print("\n✅ Monitor executado com sucesso!")
+            print("✅ Monitor executado com sucesso!")
             sys.exit(0)
         else:
-            print("\n❌ Monitor falhou")
+            print("❌ Monitor falhou")
             sys.exit(1)
             
     except Exception as e:

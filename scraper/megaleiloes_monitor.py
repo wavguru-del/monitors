@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MegaLeilões Monitor - Histórico de Lances (VERSÃO CORRIGIDA)
+MegaLeilões Monitor - Versão Final com Refresh
 
-MUDANÇAS:
 ✅ Extrai has_bid CORRETAMENTE (número > 0) usando 3 estratégias
 ✅ Salva apenas has_bid + current_value no histórico
 ✅ Atualiza tabelas base com has_bid + value
-
-FUNCIONAMENTO:
-1. Carrega TODOS os itens MegaLeilões ativos da view vw_auctions_unified
-2. Scraping via Playwright nas 6 categorias
-3. Compara links (normaliza UTM params)
-4. Para cada match: salva snapshot no auction_bid_history
-5. Atualiza tabela base com has_bid + value
+✅ Atualiza view de oportunidades após cada execução
 """
 
 import os
@@ -40,7 +33,7 @@ MEGA_CATEGORIES = [
 
 
 class MegaLeiloesMonitor:
-    """Monitor de lances MegaLeilões (VERSÃO CORRIGIDA)"""
+    """Monitor de lances MegaLeilões (VERSÃO FINAL)"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -48,7 +41,7 @@ class MegaLeiloesMonitor:
             raise ValueError("SUPABASE_URL e SUPABASE_KEY devem estar definidas")
         
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        self.db_items = {}  # {link_normalizado: {category, source, external_id, lot_number}}
+        self.db_items = {}
     
     @staticmethod
     def normalize_link(link: str) -> str:
@@ -56,12 +49,11 @@ class MegaLeiloesMonitor:
         if not link:
             return ""
         parsed = urlparse(link)
-        # Remove query params
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/')
     
     def load_database_items(self):
         """Carrega TODOS os itens ativos do banco indexados por link"""
-        print("🔥 Carregando itens do banco (MegaLeilões ativos)...")
+        print("📥 Carregando itens do banco (MegaLeilões ativos)...")
         
         try:
             page_size = 1000
@@ -107,17 +99,13 @@ class MegaLeiloesMonitor:
     
     def extract_has_bid_robust(self, card) -> bool:
         """
-        ✅ VERSÃO CORRIGIDA: Extrai has_bid com 3 estratégias (adaptado para Playwright)
+        Extrai has_bid com 3 estratégias robustas
         
         HTML esperado:
         <div class="card-views-bids">
             <span><i class="fa fa-eye"></i> 1592</span>
-            <span><i class="fa fa-legal"></i> 0</span>     <!-- Lances -->
+            <span><i class="fa fa-legal"></i> 0</span>
         </div>
-        
-        Retorna:
-            True se número de lances > 0
-            False caso contrário
         """
         try:
             # Estratégia 1: Buscar o span que contém o ícone fa-legal
@@ -132,7 +120,6 @@ class MegaLeiloesMonitor:
             # Estratégia 2: Buscar ícone e pegar texto do parent
             legal_icon = card.query_selector('i.fa-legal')
             if legal_icon:
-                # Em Playwright, precisamos avaluar JS para pegar o parent
                 parent_text = card.evaluate('''(card) => {
                     const icon = card.querySelector('i.fa-legal');
                     if (icon && icon.parentElement) {
@@ -152,7 +139,6 @@ class MegaLeiloesMonitor:
             if views_bids:
                 spans = views_bids.query_selector_all('span')
                 for span in spans:
-                    # Verifica se tem o ícone fa-legal
                     if span.query_selector('i.fa-legal'):
                         text = span.inner_text().strip()
                         numbers = re.findall(r'\d+', text)
@@ -163,21 +149,10 @@ class MegaLeiloesMonitor:
             return False
             
         except Exception as e:
-            # Em caso de erro, retorna False (sem lance)
             return False
     
     def extract_card_data(self, card):
-        """
-        Extrai dados de um card HTML (VERSÃO CORRIGIDA)
-        
-        Retorna:
-            {
-                "link": str,
-                "external_id": str,
-                "current_value": float,
-                "has_bid": bool  # ✅ TRUE apenas se número de lances > 0
-            }
-        """
+        """Extrai dados de um card HTML"""
         try:
             # Link
             link_elem = card.query_selector('a.card-title')
@@ -187,7 +162,7 @@ class MegaLeiloesMonitor:
             if not link:
                 return None
             
-            # External ID (card-number)
+            # External ID
             external_id_elem = card.query_selector('.card-number')
             external_id = external_id_elem.inner_text().strip() if external_id_elem else None
             
@@ -196,14 +171,14 @@ class MegaLeiloesMonitor:
             price_text = price_elem.inner_text().strip() if price_elem else "R$ 0"
             current_value = float(re.sub(r'[^\d,]', '', price_text).replace(',', '.')) if price_text else 0
             
-            # ✅ has_bid: EXTRAÇÃO ROBUSTA (número > 0)
+            # has_bid: EXTRAÇÃO ROBUSTA
             has_bid = self.extract_has_bid_robust(card)
             
             return {
                 "link": link,
                 "external_id": external_id,
                 "current_value": current_value,
-                "has_bid": has_bid,  # ✅ Boolean correto
+                "has_bid": has_bid,
             }
             
         except Exception as e:
@@ -228,7 +203,7 @@ class MegaLeiloesMonitor:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     page.wait_for_timeout(1000)
                 
-                # Extrai cards da página atual
+                # Extrai cards
                 cards = page.query_selector_all('.card-content')
                 
                 page_cards = 0
@@ -251,22 +226,7 @@ class MegaLeiloesMonitor:
         return cards_data, category_name, current_page
     
     def process_scraped_data(self, scraped_items):
-        """
-        Processa dados scraped e faz match com banco
-        
-        Retorna lista de registros para histórico:
-        [
-            {
-                "category": str,
-                "source": str,
-                "external_id": str,
-                "lot_number": str,
-                "has_bid": bool,  # ✅ Boolean correto
-                "current_value": float,
-                "captured_at": str (ISO)
-            }
-        ]
-        """
+        """Processa dados scraped e faz match com banco"""
         all_records = []
         
         for item in scraped_items:
@@ -281,7 +241,7 @@ class MegaLeiloesMonitor:
                 "source": db_item["source"],
                 "external_id": db_item["external_id"],
                 "lot_number": db_item["lot_number"],
-                "has_bid": item["has_bid"],  # ✅ Boolean correto
+                "has_bid": item["has_bid"],
                 "current_value": item["current_value"],
                 "captured_at": datetime.now().isoformat(),
             }
@@ -291,18 +251,13 @@ class MegaLeiloesMonitor:
         return all_records
     
     def update_base_tables(self, records):
-        """
-        Atualiza tabelas base com has_bid + value
-        
-        ✅ MUDANÇA: Agora atualiza has_bid (boolean correto) ao invés de total_bids
-        """
+        """Atualiza tabelas base com has_bid + value"""
         if not records:
             return 0
         
         updated_count = 0
         errors = 0
         
-        # Agrupa por categoria para logs organizados
         by_category = {}
         for record in records:
             cat = record["category"]
@@ -318,7 +273,7 @@ class MegaLeiloesMonitor:
                 try:
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "has_bid": record["has_bid"],  # ✅ Boolean correto
+                            "has_bid": record["has_bid"],
                             "value": record["current_value"],
                             "last_scraped_at": record["captured_at"]
                         })\
@@ -334,7 +289,6 @@ class MegaLeiloesMonitor:
                     errors += 1
                     continue
             
-            # Log por categoria
             if cat_updated > 0:
                 print(f"✅ {category:25s} | {cat_updated:3d} atualizados | {cat_errors:2d} erros")
             elif cat_errors > 0:
@@ -343,29 +297,24 @@ class MegaLeiloesMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """
-        Salva histórico de lances em lote
-        
-        ✅ MUDANÇA: Agora salva has_bid (boolean correto) ao invés de total_bids
-        """
+        """Salva histórico de lances em lote"""
         if not records:
             return 0
         
         try:
-            # Remove duplicatas por chave única
+            # Remove duplicatas
             unique_records = {}
             for record in records:
                 key = (
                     record["category"],
                     record["source"],
                     record["external_id"],
-                    record["captured_at"][:19]  # Trunca para segundos
+                    record["captured_at"][:19]
                 )
                 unique_records[key] = record
             
             records_to_insert = list(unique_records.values())
             
-            # Upsert no histórico
             response = self.supabase.schema("auctions").table("auction_bid_history")\
                 .upsert(records_to_insert, on_conflict="category,source,external_id,captured_at")\
                 .execute()
@@ -379,7 +328,7 @@ class MegaLeiloesMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 MEGALEILÕES MONITOR - HISTÓRICO DE LANCES (VERSÃO CORRIGIDA)")
+        print("🔵 MEGALEILÕES MONITOR - VERSÃO FINAL")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -410,7 +359,7 @@ class MegaLeiloesMonitor:
                 cards, cat_name, pages = self.scrape_category(page, category_url)
                 all_scraped.extend(cards)
                 
-                # Calcula matches desta categoria
+                # Calcula matches
                 cat_matches = 0
                 cat_with_bid = 0
                 for item in cards:
@@ -446,12 +395,10 @@ class MegaLeiloesMonitor:
         # Processa e salva
         all_records = self.process_scraped_data(all_scraped)
         matched_count = len(all_records)
-        
-        # Conta quantos têm lance
         with_bid_count = sum(1 for r in all_records if r.get("has_bid"))
         
         print("\n" + "="*70)
-        print("🔄 Atualizando tabelas base (has_bid, value, last_scraped_at)...")
+        print("📄 Atualizando tabelas base (has_bid, value, last_scraped_at)...")
         print("="*70)
         print()
         
@@ -473,7 +420,7 @@ class MegaLeiloesMonitor:
         print(f"🌐 Ofertas scraped: {len(all_scraped)}")
         print(f"🔗 Links matched (encontrados): {matched_count}")
         print(f"🔥 Itens com lance (has_bid=TRUE): {with_bid_count}")
-        print(f"🔄 Tabelas base atualizadas: {updated}")
+        print(f"📄 Tabelas base atualizadas: {updated}")
         print(f"💾 Registros salvos no histórico: {saved}")
         print("="*70)
         
@@ -485,6 +432,17 @@ class MegaLeiloesMonitor:
             print(f"   - Os links no banco estão no formato correto")
             print(f"   - As ofertas ainda estão ativas no site")
         
+        # ✅ ATUALIZA VIEW DE OPORTUNIDADES
+        print("\n" + "="*70)
+        print("🔄 Atualizando view de oportunidades...")
+        print("="*70)
+        
+        try:
+            self.supabase.rpc('refresh_opportunities').execute()
+            print("✅ View vw_opportunities atualizada com sucesso!\n")
+        except Exception as e:
+            print(f"⚠️ Erro ao atualizar view: {e}\n")
+        
         return True
 
 
@@ -495,10 +453,10 @@ def main():
         success = monitor.run()
         
         if success:
-            print("\n✅ Monitor executado com sucesso!")
+            print("✅ Monitor executado com sucesso!")
             sys.exit(0)
         else:
-            print("\n❌ Monitor falhou")
+            print("❌ Monitor falhou")
             sys.exit(1)
             
     except Exception as e:
