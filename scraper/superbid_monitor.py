@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SuperBid Monitor - Histórico de Lances (COM PAGINAÇÃO COMPLETA)
+SuperBid Monitor - Versão Simplificada (has_bid)
 
-✅ FIX: Agora busca TODAS as páginas de cada categoria, não só a primeira
+✅ Atualiza tabelas base com has_bid (boolean)
+✅ Salva snapshots no histórico (auction_bid_history)
+✅ Paginação completa de todas as categorias
 """
 
 import os
@@ -40,7 +42,7 @@ SUPERBID_CATEGORIES = [
 
 
 class SuperBidMonitor:
-    """Monitor de lances SuperBid com paginação completa"""
+    """Monitor de lances SuperBid com estrutura simplificada"""
     
     def __init__(self):
         """Inicializa conexões"""
@@ -108,7 +110,7 @@ class SuperBidMonitor:
     
     def fetch_superbid_category(self, category: str, page_size: int = 100, max_pages: int = 100):
         """
-        ✅ FIX: Busca TODAS as páginas de ofertas de uma categoria
+        Busca TODAS as páginas de ofertas de uma categoria
         
         Args:
             category: Nome da categoria
@@ -131,7 +133,7 @@ class SuperBidMonitor:
                     "urlSeo": f"https://exchange.superbid.net/categorias/{category}",
                     "locale": "pt_BR",
                     "orderBy": "score:desc",
-                    "pageNumber": page_num,  # ✅ Agora incrementa!
+                    "pageNumber": page_num,
                     "pageSize": page_size,
                     "portalId": "[2,15]",
                     "requestOrigin": "marketplace",
@@ -188,7 +190,7 @@ class SuperBidMonitor:
         return all_offers
     
     def process_offer(self, offer):
-        """Processa uma oferta e retorna dados para histórico"""
+        """Processa uma oferta e retorna dados para atualização"""
         offer_id = offer.get("id")
         if not offer_id:
             return None
@@ -201,27 +203,40 @@ class SuperBidMonitor:
         if not db_item:
             return None
         
-        # Extrai dados de lances da API
+        # ✅ NOVA ESTRUTURA: Extrai has_bid (boolean) da API
         total_bids = offer.get("totalBids", 0)
-        total_bidders = offer.get("totalBidders", 0)
+        has_bid = total_bids > 0  # Converte contador em boolean
         
+        # Extrai valor atual
         detail = offer.get("offerDetail", {})
         current_value = detail.get("currentMinBid") or detail.get("initialBidValue")
         
-        # Retorna dados combinados: info do banco + lances da API
+        # Timestamp da captura
+        captured_at = datetime.now().isoformat()
+        
+        # Retorna dados combinados
         return {
+            # Identificação (do banco)
             "category": db_item["category"],
             "source": db_item["source"],
             "external_id": db_item["external_id"],
             "lot_number": db_item["lot_number"],
-            "total_bids": total_bids,
-            "total_bidders": total_bidders,
+            
+            # Dados de lance (da API) - ✅ SIMPLIFICADO
+            "has_bid": has_bid,
             "current_value": current_value,
-            "captured_at": datetime.now().isoformat(),
+            "captured_at": captured_at,
         }
     
     def update_base_tables(self, records):
-        """Atualiza tabelas base com dados de lances"""
+        """
+        Atualiza tabelas base com has_bid e valor atual
+        
+        Campos atualizados:
+        - has_bid (boolean)
+        - value (numeric)
+        - last_scraped_at (timestamp)
+        """
         if not records:
             return 0
         
@@ -236,16 +251,17 @@ class SuperBidMonitor:
                 by_category[cat] = []
             by_category[cat].append(record)
         
+        print()
         for category, cat_records in by_category.items():
             cat_updated = 0
             cat_errors = 0
             
             for record in cat_records:
                 try:
+                    # ✅ Atualiza apenas has_bid, value e last_scraped_at
                     self.supabase.schema("auctions").table(category)\
                         .update({
-                            "total_bids": record["total_bids"],
-                            "total_bidders": record["total_bidders"],
+                            "has_bid": record["has_bid"],
                             "value": record["current_value"],
                             "last_scraped_at": record["captured_at"]
                         })\
@@ -270,14 +286,37 @@ class SuperBidMonitor:
         return updated_count
     
     def save_bid_history(self, records):
-        """Salva histórico de lances em lote"""
+        """
+        Salva snapshots no histórico
+        
+        Tabela: auction_bid_history
+        Campos:
+        - category, source, external_id, lot_number (identificação)
+        - has_bid (boolean)
+        - current_value (numeric)
+        - captured_at (timestamp)
+        """
         if not records:
             return 0
         
         try:
+            # Prepara registros para inserção no histórico
+            history_records = []
+            
+            for record in records:
+                history_records.append({
+                    "category": record["category"],
+                    "source": record["source"],
+                    "external_id": record["external_id"],
+                    "lot_number": record["lot_number"],
+                    "has_bid": record["has_bid"],  # ✅ Boolean
+                    "current_value": record["current_value"],
+                    "captured_at": record["captured_at"]
+                })
+            
             # Remove duplicatas baseado em chave única
             unique_records = {}
-            for record in records:
+            for record in history_records:
                 key = (
                     record["category"],
                     record["source"],
@@ -288,8 +327,12 @@ class SuperBidMonitor:
             
             records_to_insert = list(unique_records.values())
             
+            # Insere em lote (upsert para evitar duplicatas)
             response = self.supabase.schema("auctions").table("auction_bid_history")\
-                .upsert(records_to_insert, on_conflict="category,source,external_id,captured_at")\
+                .upsert(
+                    records_to_insert,
+                    on_conflict="category,source,external_id,captured_at"
+                )\
                 .execute()
             
             return len(response.data)
@@ -301,7 +344,7 @@ class SuperBidMonitor:
     def run(self):
         """Executa monitoramento completo"""
         print("\n" + "="*70)
-        print("🔵 SUPERBID MONITOR - HISTÓRICO DE LANCES (COM PAGINAÇÃO)")
+        print("🔵 SUPERBID MONITOR - VERSÃO SIMPLIFICADA (has_bid)")
         print("="*70)
         print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*70)
@@ -325,7 +368,7 @@ class SuperBidMonitor:
         for category in SUPERBID_CATEGORIES:
             print(f"📦 {category}")
             
-            # ✅ Agora busca TODAS as páginas!
+            # Busca TODAS as páginas
             offers = self.fetch_superbid_category(category)
             total_offers += len(offers)
             
@@ -348,30 +391,30 @@ class SuperBidMonitor:
         
         # Atualiza tabelas base
         print("="*70)
-        print("🔄 Atualizando tabelas base (total_bids, total_bidders, value, last_scraped_at)...")
+        print("📝 Atualizando tabelas base (has_bid, value, last_scraped_at)...")
         print("="*70)
-        print()
         
         updated = self.update_base_tables(all_records)
         
         # Salva histórico
         print()
         print("="*70)
-        print("💾 Salvando histórico de lances na tabela auction_bid_history...")
+        print("💾 Salvando snapshots no histórico (auction_bid_history)...")
         print("="*70)
         
         saved = self.save_bid_history(all_records)
         
-        print(f"\n✅ {saved} registros salvos no histórico")
+        print(f"\n✅ {saved} snapshots salvos no histórico")
         
+        # Resumo final
         print("\n" + "="*70)
         print("📊 RESUMO DA EXECUÇÃO")
         print("="*70)
         print(f"📋 Itens SuperBid na view: {len(self.db_items)}")
         print(f"📡 Ofertas retornadas da API: {total_offers}")
         print(f"🔗 Links matched (encontrados): {matched_count}")
-        print(f"🔄 Tabelas base atualizadas: {updated}")
-        print(f"💾 Registros salvos no histórico: {saved}")
+        print(f"📝 Tabelas base atualizadas: {updated}")
+        print(f"💾 Snapshots salvos no histórico: {saved}")
         print("="*70)
         
         if len(self.db_items) > 0:
